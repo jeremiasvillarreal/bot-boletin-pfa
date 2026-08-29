@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: bot-scraper
+    env: python
+    plan: free
+    dockerCommand: python bot/main.py
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: HF_TOKEN
+        sync: false
+      - key: BOLETIN_PALABRAS
+        value: "Policia Federal Argentina,Fuerzas de seguridad"
+      - key: BOLETIN_NOTIFY_CHAT_ID
+        sync: false
+      - key: BOT_ADMIN_ID
+        sync: false
+      - key: PORT
+        value: 8000
+      - key: MODO
+        value: cloud
+      - key: CHROME_CDP_URL
+        value: http://localhost:9222
