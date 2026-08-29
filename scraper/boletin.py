@@ -14,6 +14,7 @@ Uso:
 """
 
 import asyncio
+import logging
 import re
 import unicodedata
 from datetime import date, datetime
@@ -334,160 +335,111 @@ async def filtrar_por_palabras_full(avisos: list[dict], palabras: list[str], max
     return uniq
 
 def _resumen_extractivo(texto: str, titulo: str = "") -> str:
-    """Resumen fácil en español, con monto y destinatarios, para Telegram."""
+    """Resumen claro en 1-2 oraciones: de qué trata la norma."""
     if not texto or len(texto.strip()) < 50:
         texto = titulo
     import re
-    # limpiar encoding artefactos � y normalizar
     txt = texto.replace("\n", " ").strip()
     txt = txt.replace("�", " ")
     txt = re.sub(r"\s+", " ", txt)
-    # organismo (primeras palabras en mayúsculas antes de Decreto/Resolución)
-    organismo = ""
-    m_org = re.search(r"^(MINISTERIO[^A-Z]*[A-Z][^a-z]{2,80}|ENTE[^A-Z]*[A-Z].{5,80}|POLICIA FEDERAL.{{0,30}})", txt)
-    if m_org:
-        organismo = m_org.group(1).strip()[:80]
-    # extraer monto y período
-    monto = ""
-    m = re.search(r"(PESOS\s*[\d\.\,]+\s*\(\s*\$[\d\.\,]+\)?|\$\s*[\d\.\,]+)", txt, re.I)
-    if m:
-        monto = m.group(1).strip()
-        # limpiar duplicado "PESOS CINCUENTA MIL ($50.000)" -> "$50.000"
-        if "$" in monto:
-            monto = re.search(r"\$\s*[\d\.\,]+", monto).group(0)
-    # tipo de norma
-    tipo = titulo.strip()[:120] if titulo else "Norma"
-    # destinatarios - detectar lista
-    dests = []
-    low = txt.lower()
-    if "polic" in low and "federal" in low:
-        dests.append("Policía Federal Argentina")
-    if "gendarmer" in low:
-        dests.append("Gendarmería")
-    if "prefectura" in low:
-        dests.append("Prefectura Naval")
-    if "seguridad aeroportuaria" in low or "psa" in low:
-        dests.append("PSA")
-    if not dests and "fuerzas" in low:
-        dests.append("Fuerzas de Seguridad Federales")
-    dest_str = ", ".join(dests) if dests else ""
-    # objeto: buscar frase con Otórgase/Dispone
     frases = re.split(r"(?<=[\.。])\s+", txt)
-    objeto = ""
+
+    # 1) Buscar frase clave que resuma el objeto (otorga, dispone, autoriza, crea, modifica)
+    palabras_clave = ["otorg", "dispone", "autoriza", "crea", "modifica", "establece",
+                       "aprueba", "designa", "remueve", "suma fija", "bonif", "asigna",
+                       "declara", "reconoce", "resuelve"]
+    frase_objeto = ""
     for f in frases:
         fl = f.lower()
-        if any(k in fl for k in ["otorgase suma fija", "otórgase suma fija", "otorgase suma", "suma fija remunerativa"]):
-            objeto = f.strip()
+        if any(k in fl for k in palabras_clave):
+            frase_objeto = re.sub(r"\s+", " ", f.strip())
             break
-    if not objeto:
-        for f in frases:
-            if "suma fija" in f.lower():
-                objeto = f.strip()
-                break
-    if objeto:
-        objeto = re.sub(r"\s+", " ", objeto)
-        # recortar si muy largo
-        if len(objeto) > 280:
-            objeto = objeto[:280].rstrip() + "…"
-    else:
-        # genérico: 2 frases relevantes cortas
-        rel = [f.strip() for f in frases if any(k in f.lower() for k in ["polic", "fuerza", "gendar", "prefect", "suma", "otorg"])]
-        objeto = rel[0][:280] if rel else txt[:280]
-    # construir resumen fácil con emojis (Telegram-friendly)
+
+    # 2) Armar una oración clara: qué hace + a quién
     partes = []
-    partes.append(f"📌 {tipo}")
-    if monto:
-        partes.append(f"💰 {monto} por única vez")
-    elif "suma fija" in objeto.lower():
-        partes.append(f"💰 Suma fija por única vez")
-    if dest_str:
-        partes.append(f"👥 Para: {dest_str}")
-    if organismo and organismo.lower() not in tipo.lower():
-        partes.append(f"🏛️ {organismo}")
-    # objeto resumido
-    # limpiar objeto de artefactos y monto repetido
-    obj_clean = objeto
-    if monto and monto in obj_clean:
-        # evitar duplicado
-        pass
-    # si objeto es muy parecido al título, no repetir
-    if obj_clean and obj_clean[:40].lower() not in tipo.lower():
-        partes.append(f"📝 {obj_clean[:260]}")
-    resumen = "\n".join(partes)
-    # fallback si quedó muy corto
-    if len(resumen) < 60:
-        resumen = f"📌 {tipo}\n📝 {txt[:500]}"
+    if titulo:
+        partes.append(titulo.strip()[:140])
+
+    if frase_objeto:
+        # recortar a 2 oraciones como mucho
+        if len(frase_objeto) > 300:
+            frase_objeto = frase_objeto[:300].rstrip() + "…"
+        partes.append(frase_objeto)
+    else:
+        # tomar las 2 frases más relevantes
+        rel = [f.strip() for f in frases if len(f.strip()) > 30][:3]
+        if rel:
+            partes.append(". ".join(rel)[:400])
+        else:
+            partes.append(txt[:400])
+
+    resumen = " — ".join(partes) if len(partes) > 1 else partes[0]
     return resumen[:950]
 
 async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) -> str:
-    """Resumen IA generativo via HF router, fallback extractivo inteligente."""
+    """Resumen real en 1-2 oraciones: de qué trata la norma del Boletín Oficial."""
     if not texto or len(texto.strip()) < 50:
         texto = titulo
     texto = texto[:7000]
-    # intentar HF si hay token
-    if hf_token and hf_token.strip().startswith("hf_"):
-        try:
-            token = hf_token.strip()
-            # 1) bart-large-cnn para resumen extractivo
-            url = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            # cortar a 2000 para que bart no se sature con español largo
-            payload = {
-                "inputs": texto[:2200],
-                "parameters": {"max_length": 140, "min_length": 30, "do_sample": False},
-            }
-            async with httpx.AsyncClient(timeout=25.0) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    summ = None
-                    if isinstance(data, list) and data and "summary_text" in data[0]:
-                        summ = data[0]["summary_text"].strip()
-                    elif isinstance(data, dict) and "summary_text" in data:
-                        summ = data["summary_text"].strip()
-                    if summ and len(summ) > 30 and len(summ) < len(texto) * 0.9:
-                        low = summ.lower()
-                        # solo aceptar si contiene info relevante, sino descartar (evita genérico)
-                        if any(k in low for k in ["suma", "policia", "gendar", "prefect", "otorga", "decreto", "pesos", "50", "fuerza"]):
-                            if len(summ) < 80:
-                                summ = titulo + " — " + summ
-                            return summ[:900]
-                        # genérico -> no retornar, probar Mistral/extractivo
-                if resp.status_code in (503, 429):
-                    await asyncio.sleep(2)
-                    async with httpx.AsyncClient(timeout=25.0) as c2:
-                        r2 = await c2.post(url, headers=headers, json=payload)
-                        if r2.status_code == 200:
-                            d2 = r2.json()
-                            if isinstance(d2, list) and d2 and "summary_text" in d2[0]:
-                                s2 = d2[0]["summary_text"].strip()
-                                if s2 and len(s2) > 30 and any(k in s2.lower() for k in ["suma", "policia", "gendar", "otorga", "50"]):
-                                    return s2[:900]
-            # 2) fallback Mistral instruct para resumen en español si bart no sirvió
-            try:
-                url2 = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.3"
-                prompt = f"[INST] Resumí en 2-3 líneas en español rioplatense, claro y conciso, de qué trata esta norma del Boletín Oficial. Título: {titulo}. Texto: {texto[:1800]} [/INST]"
-                payload2 = {"inputs": prompt, "parameters": {"max_new_tokens": 180, "temperature": 0.3}}
-                async with httpx.AsyncClient(timeout=25.0) as c3:
-                    r3 = await c3.post(url2, headers=headers, json=payload2)
-                    if r3.status_code == 200:
-                        d3 = r3.json()
-                        gen = ""
-                        if isinstance(d3, list) and d3 and "generated_text" in d3[0]:
-                            gen = d3[0]["generated_text"]
-                            # extraer después de [/INST]
-                            if "[/INST]" in gen:
-                                gen = gen.split("[/INST]")[-1].strip()
-                        elif isinstance(d3, dict) and "generated_text" in d3:
-                            gen = d3["generated_text"]
-                        gen = gen.strip()[:900]
-                        if gen and len(gen) > 40:
-                            return gen
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"[resumir_ia] HF falló, fallback extractivo: {e}")
-    # fallback extractivo inteligente
+
+    if not (hf_token and hf_token.strip().startswith("hf_")):
+        return _resumen_extractivo(texto, titulo)
+
+    token = hf_token.strip()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # 1) Mistral Instruct — resumen generativo real (1-2 oraciones claras)
+    try:
+        url = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.3"
+        prompt = (
+            f"[INST] Escribí UNA sola oración en español rioplatense que resuma de qué trata "
+            f"esta norma del Boletín Oficial. Sé claro y directo. Solo la oración, sin intro.\n\n"
+            f"Título: {titulo}\n"
+            f"Texto: {texto[:2000]} [/INST]"
+        )
+        payload = {"inputs": prompt, "parameters": {"max_new_tokens": 150, "temperature": 0.2}}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                gen = ""
+                if isinstance(data, list) and data and "generated_text" in data[0]:
+                    gen = data[0]["generated_text"]
+                elif isinstance(data, dict) and "generated_text" in data:
+                    gen = data["generated_text"]
+                # extraer después de [/INST]
+                if "[/INST]" in gen:
+                    gen = gen.split("[/INST]")[-1].strip()
+                gen = gen.strip()
+                # limpiar artefactos
+                gen = re.sub(r"^(Resumen:|La norma|Esta norma|El decreto)\s*", "", gen, flags=re.I).strip()
+                if gen and len(gen) > 30:
+                    return gen[:950]
+    except Exception as e:
+        logging.getLogger(__name__).debug("Mistral falló: %s", e)
+
+    # 2) bart-large-cnn — extractivo (puede servir como respaldo)
+    try:
+        url2 = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
+        payload2 = {
+            "inputs": texto[:2200],
+            "parameters": {"max_length": 130, "min_length": 25, "do_sample": False},
+        }
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp2 = await client.post(url2, headers=headers, json=payload2)
+            if resp2.status_code == 200:
+                data2 = resp2.json()
+                summ = None
+                if isinstance(data2, list) and data2 and "summary_text" in data2[0]:
+                    summ = data2[0]["summary_text"].strip()
+                elif isinstance(data2, dict) and "summary_text" in data2:
+                    summ = data2["summary_text"].strip()
+                if summ and len(summ) > 30:
+                    return summ[:950]
+    except Exception:
+        pass
+
+    # 3) Fallback: extractivo propio (1-2 oraciones claras)
     return _resumen_extractivo(texto, titulo)
 
 # CLI para testing
