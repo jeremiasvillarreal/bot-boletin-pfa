@@ -57,26 +57,29 @@ if not HF_TOKEN:
     except Exception:
         pass
 
+BOLETIN_PALABRAS_DEFAULT: list[str] = ["Policia Federal Argentina", "Fuerzas de seguridad"]
 BOLETIN_PALABRAS: str = os.getenv("BOLETIN_PALABRAS", "").strip()
 BOLETIN_NOTIFY_CHAT_ID: str = os.getenv("BOLETIN_NOTIFY_CHAT_ID", "").strip()
 BOT_ADMIN_ID: str = os.getenv("BOT_ADMIN_ID", "").strip()
 
 def get_boletin_palabras() -> list[str]:
-    """Lista global palabras, re-lee env cada vez para soportar /boletin_add en runtime."""
+    """Lista global palabras, re-lee env cada vez para soportar /boletin_add en runtime.
+    Siempre devuelve al menos las palabras por defecto (PFA + Fuerzas de seguridad).
+    """
     raw = os.getenv("BOLETIN_PALABRAS", BOLETIN_PALABRAS)
-    if not raw or not raw.strip():
-        # intentar leer de archivo persistente data/boletin_palabras.json
-        try:
-            import json
-            p = os.path.join(os.path.dirname(__file__), "..", "data", "boletin_palabras.json")
-            if os.path.exists(p):
-                with open(p, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if isinstance(data, list) and data:
-                        return [str(x).strip() for x in data if str(x).strip()]
-                    if isinstance(data, dict) and data.get("palabras"):
-                        return [str(x).strip() for x in data["palabras"] if str(x).strip()]
-        except Exception:
-            pass
-        return []
-    return [p.strip() for p in raw.split(",") if p.strip()]
+    if raw and raw.strip():
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    # intentar leer de archivo persistente data/boletin_palabras.json
+    try:
+        import json
+        p = os.path.join(os.path.dirname(__file__), "..", "data", "boletin_palabras.json")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list) and data:
+                    return [str(x).strip() for x in data if str(x).strip()]
+                if isinstance(data, dict) and data.get("palabras"):
+                    return [str(x).strip() for x in data["palabras"] if str(x).strip()]
+    except Exception:
+        pass
+    return BOLETIN_PALABRAS_DEFAULT[:]

@@ -59,24 +59,14 @@ async def boletin_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception:
         pass
     now = datetime.now(BA_TZ).strftime("%Y-%m-%d %H:%M %Z")
-    if not palabras:
-        txt = (
-            "📋 *Boletín Oficial 1ra+3ra* — modo manual `go`\n"
-            f"🕐 Ahora: `{now}`\n"
-            f"▶️ Escribí `go` o `go 27/08/2026` para buscar\n"
-            f"🔑 Palabras: _(vacía)_ → `/boletin_add Policia Federal Argentina, Fuerzas de seguridad`\n"
-            f"📊 Último: {ultimo}\n"
-            f"💡 Comandos: `go` / `go DD/MM/AAAA` / `/boletin_list`"
-        )
-    else:
-        txt = (
-            "📋 *Boletín Oficial 1ra+3ra* — modo manual `go`\n"
-            f"🕐 Ahora: `{now}`\n"
-            f"▶️ `go` (hoy) o `go DD/MM/AAAA`\n"
-            f"🔑 Palabras: `{', '.join(palabras)}` (1ra+3ra, indistinto tildes)\n"
-            f"📊 Último: {ultimo}\n"
-            f"💡 Tip: `go 03/08/2026` busca esa fecha"
-        )
+    txt = (
+        "📋 *Boletín Oficial 1ra+3ra* — modo manual `go`\n"
+        f"🕐 Ahora: `{now}`\n"
+        f"▶️ `go` (hoy) o `go DD/MM/AAAA`\n"
+        f"🔑 Palabras: `{', '.join(palabras)}`\n"
+        f"📊 Último: {ultimo}\n"
+        f"💡 Tip: `go 03/08/2026` busca esa fecha"
+    )
     await update.message.reply_text(txt, parse_mode="Markdown")
 
 async def boletin_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -207,9 +197,6 @@ async def go_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     fecha, label = _parse_fecha_arg(raw_text)
 
     palabras = _load_palabras()
-    if not palabras:
-        await update.message.reply_text("⚠️ Sin palabras globales. Usá `/boletin_add Policia Federal Argentina, Fuerzas de seguridad`", parse_mode="Markdown")
-        return
     status_msg = await update.message.reply_text(f"🚀 *GO {label}* — buscando Boletín 1ra+3ra del {label} para: `{', '.join(palabras)}`…\n⏳ Esto puede tardar 15-25s (scrape + IA)", parse_mode="Markdown")
     logger.info("[go_handler] GO %s palabras=%s chat=%s", label, palabras, update.effective_chat.id if update.effective_chat else "?")
     try:
