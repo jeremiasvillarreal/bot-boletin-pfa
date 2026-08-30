@@ -7,7 +7,7 @@ Arquitectura:
   - Si run_polling() muere → rebuild Application → retry con backoff
 
 Healthcheck:
-  GET /health -> 200 OK
+  GET /health -> SIEMPRE 200 (nunca 503, para que Render no mate el servicio)
 """
 
 import logging
@@ -18,7 +18,6 @@ import time
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from telegram.ext import Application
 
 from bot.config import MODO, PORT, TELEGRAM_TOKEN
@@ -42,35 +41,26 @@ logger = logging.getLogger(__name__)
 
 health_app = FastAPI(title="Telegram Bot Health")
 
-# Estado del polling para health endpoint
-_polling_alive = False
 _polling_restarts = 0
 
 
 @health_app.get("/health")
 async def health():
-    """Health endpoint para Render y UptimeRobot."""
-    if not _polling_alive and _polling_restarts > 0:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "degraded", "restarts": _polling_restarts},
-        )
+    """Health endpoint para Render y UptimeRobot.
+
+    SIEMPRE devuelve 200 para que Render no reinicie el servicio.
+    La info de estado va en el body.
+    """
     return {"status": "ok", "restarts": _polling_restarts}
 
 
 @health_app.get("/")
 async def root():
-    return {
-        "status": "ok",
-        "bot": "telegram-modular",
-        "mode": MODO,
-        "polling": "alive" if _polling_alive else "down",
-        "restarts": _polling_restarts,
-    }
+    return {"status": "ok", "bot": "telegram-modular", "mode": MODO, "restarts": _polling_restarts}
 
 
 def start_health_server() -> None:
-    """Health server en daemon thread (no bloquea el main)."""
+    """Health server en daemon thread."""
     def _run():
         logger.info("[health] FastAPI en 0.0.0.0:%d", PORT)
         uvicorn.run(health_app, host="0.0.0.0", port=PORT, log_level="warning")
@@ -83,7 +73,7 @@ def build_application() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     register_handlers(app)
     setup_jobs(app)
-    logger.info("[bot] Application construida (handlers + jobs OK)")
+    logger.info("[bot] Application OK")
     return app
 
 
@@ -93,14 +83,14 @@ def main() -> None:
     Main thread  → polling Telegram (run_polling + restart loop)
     Daemon thread → health server FastAPI
     """
-    global _polling_alive, _polling_restarts
+    global _polling_restarts
 
     logger.info("[bot] Iniciando — MODO=%s PORT=%d", MODO, PORT)
 
     # 1) Health server en daemon thread
     start_health_server()
 
-    # 2) Señales — solo main thread puede registrar
+    # 2) Señales — solo main thread
     def _on_signal(signum, _frame):
         logger.info("[bot] Señal %s, saliendo...", signal.Signals(signum).name)
         sys.exit(0)
@@ -111,17 +101,15 @@ def main() -> None:
         except (ValueError, OSError):
             pass
 
-    # 3) Polling loop con restart automático
-    #    run_polling() DEBE correr en el main thread para PTB v20.x
-    delay = 30  # segundos entre reintentos
+    # 3) Polling loop con restart
+    delay = 30
 
     while True:
-        _polling_alive = True
         try:
-            logger.info("[bot] Construyendo Application...")
+            logger.info("[bot] Build Application...")
             application = build_application()
 
-            logger.info("[bot] Iniciando polling (poll_interval=2s)...")
+            logger.info("[bot] run_polling()...")
             application.run_polling(
                 allowed_updates=None,
                 drop_pending_updates=False,
@@ -129,21 +117,18 @@ def main() -> None:
                 read_timeout=15,
                 connect_timeout=15,
             )
-            # Limpio: run_polling retornó (e.g. stop() llamado)
-            logger.warning("[bot] run_polling terminó limpiamente. Reiniciando en %ds...", delay)
-            delay = 10  # parada limpia → restart rápido
+            # Limpio
+            logger.warning("[bot] Polling terminó limpiamente. Restart en 10s...")
+            delay = 10
 
         except Exception:
-            logger.exception("[bot] Excepción en polling. Reiniciando en %ds...", delay)
-            delay = min(delay * 2, 300)  # backoff exponencial, max 5 min
+            logger.exception("[bot] Polling crasheado. Restart en %ds...", delay)
+            delay = min(delay * 2, 300)
 
         finally:
-            _polling_alive = False
             _polling_restarts += 1
 
-        logger.info("[bot] Reinicio #%d en %ds...", _polling_restarts, delay)
         time.sleep(delay)
-        # Reset delay para próximo ciclo (si no hay error)
         delay = 30
 
 
