@@ -52,23 +52,28 @@ logger = logging.getLogger(__name__)
 health_app = FastAPI(title="Telegram Bot Health")
 
 # Flag global para monitorear estado del polling desde health endpoint
-_polling_alive = False
+# None = startup (aún no arrancó), True = vivo, False = muerto tras haber estado vivo
+_polling_alive: bool | None = None
 _polling_restarts = 0
 
 
 @health_app.get("/health")
 async def health():
     """Endpoint para Render healthCheckPath y UptimeRobot.
-    Retorna 503 si el polling está muerto para que Render reinicie el servicio.
+
+    Estados:
+      - _polling_alive is None  → startup, aún no arrancó → 200
+      - _polling_alive is True  → todo OK → 200
+      - _polling_alive is False → polling murió → 503 (Render reinicia)
     """
-    if not _polling_alive:
-        # Polling caído: devolver 503 para que Render reinicie
+    if _polling_alive is False and _polling_restarts > 0:
         from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=503,
             content={"status": "degraded", "polling": "down", "restarts": _polling_restarts},
         )
-    return {"status": "ok", "polling": "alive", "restarts": _polling_restarts}
+    status = "starting" if _polling_alive is None else "ok"
+    return {"status": status, "polling": "alive" if _polling_alive else status, "restarts": _polling_restarts}
 
 
 @health_app.get("/")
@@ -78,7 +83,7 @@ async def root():
         "status": "ok",
         "bot": "telegram-modular",
         "mode": MODO,
-        "polling": "alive" if _polling_alive else "down",
+        "polling": "starting" if _polling_alive is None else ("alive" if _polling_alive else "down"),
         "restarts": _polling_restarts,
     }
 
