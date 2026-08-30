@@ -71,7 +71,6 @@ def build_application() -> Application:
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .get_updates_timeout(30)
         .read_timeout(30)
         .connect_timeout(15)
         .build()
