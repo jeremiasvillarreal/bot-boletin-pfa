@@ -13,6 +13,8 @@ import logging
 import signal
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 
 import uvicorn
 from fastapi import FastAPI
@@ -22,6 +24,9 @@ from bot.config import MODO, PORT, TELEGRAM_TOKEN
 from bot.handlers import register_handlers
 from bot.jobs.boletin_scheduler import setup_boletin_jobs
 from bot.jobs.scheduler import setup_jobs
+
+# Timestamp de inicio para /sysinfo
+StartTime = datetime.now(timezone.utc)
 
 # --- Logging ---
 
@@ -63,13 +68,21 @@ def start_health_server() -> threading.Thread:
 
 def build_application() -> Application:
     """Construye Application de PTB, registra handlers y jobs."""
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .get_updates_timeout(30)
+        .read_timeout(30)
+        .connect_timeout(15)
+        .build()
+    )
 
     register_handlers(app)
     logger.info("[bot] Handlers registrados")
 
     setup_jobs(app)
-    logger.info("[bot] Jobs configurados")
+    setup_boletin_jobs(app)
+    logger.info("[bot] Jobs configurados (scrape_demo + boletin 07/08)")
 
     return app
 
@@ -98,22 +111,22 @@ def main() -> None:
     # 3) Polling con restart automático
     #    Si run_polling() muere (Render sleep, network, exception),
     #    reconstruye Application y relanza.
+    restart_count = 0
     while True:
+        restart_count += 1
         try:
             application = build_application()
-            logger.info("[bot] Iniciando polling...")
+            logger.info("[bot] Iniciando polling... (restart #%d)", restart_count)
             application.run_polling(
                 allowed_updates=None,
-                drop_pending_updates=False,
+                drop_pending_updates=True,
             )
             # Limpio: run_polling retornó
             logger.warning("[bot] Polling terminó limpiamente. Restart en 10s...")
         except Exception:
             logger.exception("[bot] Polling crasheado. Restart en 30s...")
-            import time
             time.sleep(30)
             continue
-        import time
         time.sleep(10)
 
 

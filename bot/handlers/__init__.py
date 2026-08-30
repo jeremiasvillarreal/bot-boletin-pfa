@@ -12,6 +12,7 @@ Para agregar un nuevo bot/feature:
 from telegram.ext import Application
 
 from bot.handlers.boletin import register_boletin_handlers
+from bot.handlers.info import register_info_handlers
 from bot.handlers.scraper import register_scraper_handlers
 from bot.handlers.start import register_start_handlers
 from bot.handlers.utilidades import register_utilidades_handlers
@@ -22,4 +23,5 @@ def register_handlers(application: Application) -> None:
     register_start_handlers(application)
     register_scraper_handlers(application)
     register_utilidades_handlers(application)
+    register_info_handlers(application)
     register_boletin_handlers(application)
