@@ -3,7 +3,7 @@ bot.main — Entrypoint del Bot Telegram modular 24/7 con watchdog.
 
 Arquitectura:
   - Main thread: FastAPI /health (uvicorn.run) — keep-alive para Render + UptimeRobot
-  - Thread separado: Telegram polling con auto-restart (watchdog)
+  - Thread daemon: Telegram polling con auto-restart (watchdog)
   - Si el polling muere (Render sleep, network blip, exception) → se reconstruye
     la Application y se relanza automáticamente después de un cooldown.
 
@@ -12,22 +12,19 @@ Flujo:
   2. Lanza health server en main thread (bloquea aquí)
   3. Polling corre en thread watchdog con restart automático
 
-Requisitos:
-  pip install -r requirements-bot.txt
-  # .env con TELEGRAM_TOKEN (ver .env.example)
-
 Healthcheck (para Render / UptimeRobot):
-  GET /health -> {"status":"ok"}
-  GET /       -> {"status":"ok","bot":"telegram-modular","mode":"local|cloud"}
+  GET /health -> 200 si OK, 503 si polling caído
 """
 
 import logging
 import signal
+import sys
 import threading
 import time
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from telegram.ext import Application
 
 from bot.config import MODO, PORT, TELEGRAM_TOKEN
@@ -40,6 +37,7 @@ from bot.jobs.scheduler import setup_jobs
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
+    stream=sys.stdout,
 )
 # Silenciar librerías ruidosas
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -51,29 +49,33 @@ logger = logging.getLogger(__name__)
 
 health_app = FastAPI(title="Telegram Bot Health")
 
-# Flag global para monitorear estado del polling desde health endpoint
-# None = startup (aún no arrancó), True = vivo, False = muerto tras haber estado vivo
+# Estado del polling:
+#   None  = startup (aún no arrancó)
+#   True  = polling vivo y funcionando
+#   False = polling murió tras haber estado vivo → Render debe reiniciar
 _polling_alive: bool | None = None
 _polling_restarts = 0
 
 
 @health_app.get("/health")
 async def health():
-    """Endpoint para Render healthCheckPath y UptimeRobot.
+    """Health endpoint para Render healthCheckPath y UptimeRobot.
 
-    Estados:
-      - _polling_alive is None  → startup, aún no arrancó → 200
-      - _polling_alive is True  → todo OK → 200
-      - _polling_alive is False → polling murió → 503 (Render reinicia)
+    Retorna 200 durante startup y cuando todo OK.
+    Retorna 503 solo si el polling estaba vivo y después murió
+    (para que Render reinicie el servicio).
     """
     if _polling_alive is False and _polling_restarts > 0:
-        from fastapi.responses import JSONResponse
         return JSONResponse(
             status_code=503,
-            content={"status": "degraded", "polling": "down", "restarts": _polling_restarts},
+            content={
+                "status": "degraded",
+                "polling": "down",
+                "restarts": _polling_restarts,
+            },
         )
     status = "starting" if _polling_alive is None else "ok"
-    return {"status": status, "polling": "alive" if _polling_alive else status, "restarts": _polling_restarts}
+    return {"status": status, "restarts": _polling_restarts}
 
 
 @health_app.get("/")
@@ -88,43 +90,31 @@ async def root():
     }
 
 
-def start_health_server() -> None:
-    """Lanza uvicorn en thread daemon en puerto PORT."""
-    # Se ejecuta en el main thread (uvicorn.run bloquea)
-    logger.info("[health] Iniciando FastAPI en 0.0.0.0:%d (/health)", PORT)
-    uvicorn.run(health_app, host="0.0.0.0", port=PORT, log_level="warning")
-
-
 def build_application() -> Application:
     """Construye Application de PTB, registra handlers y jobs."""
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     register_handlers(app)
-    logger.info("[bot] Handlers registrados (start, scraper, utilidades, boletin)")
+    logger.info("[bot] Handlers registrados")
 
     setup_jobs(app)
-    logger.info("[bot] Jobs demo configurados")
-    # Modo manual "go" — jobs programados desactivados (activar si querés 07:00/08:00):
-    # setup_boletin_jobs(app)
-    # logger.info("[bot] Jobs boletín 07:00/08:00 configurados")
-    logger.info("[bot] Boletín modo manual 'go' — sin jobs programados")
+    logger.info("[bot] Jobs configurados")
 
     return app
 
 
 # --- Polling watchdog ---
 
-# Cooldowns para restart del polling
 POLL_RESTART_DELAY = 30       # segundos antes de reconstruir tras crash
-POLL_COOLDOWN_SUCCESS = 10    # segundos de espera si terminó sin error (parada limpia)
-POLL_MAX_DELAY = 300          # tope máximo de espera entre reintentos (5 min)
+POLL_COOLDOWN_SUCCESS = 10    # segundos si terminó sin error (parada limpia)
+POLL_MAX_DELAY = 300          # tope máximo de espera (5 min)
 
 
 def _polling_watchdog() -> None:
     """Thread watchdog que mantiene el polling vivo.
 
-    Si run_polling() termina (por exception o return), espera un cooldown
-    y reconstruye la Application para relanzar polling limpio.
+    Loop infinito: si run_polling() termina (exception o return),
+    espera cooldown → rebuild Application → relanza.
     """
     global _polling_alive, _polling_restarts
 
@@ -138,28 +128,16 @@ def _polling_watchdog() -> None:
             logger.info("[polling] Construyendo Application...")
             application = build_application()
 
-            # Manejo de señales dentro del thread (PTB los necesita)
-            def _signal_handler(signum, _frame):
-                logger.info("[polling] Señal recibida %s", signal.Signals(signum).name)
-
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                try:
-                    signal.signal(sig, _signal_handler)
-                except ValueError:
-                    pass
-
-            logger.info("[polling] Iniciando run_polling...")
+            logger.info("[polling] Iniciando run_polling (poll_interval=2s, timeouts=15s)...")
             application.run_polling(
                 allowed_updates=None,
                 drop_pending_updates=False,
-                # Tuning de reconexión
-                poll_interval=2.0,         # 2s entre polls (default: 0, lo pone PTB)
-                read_timeout=15,           # timeout de lectura
-                connect_timeout=15,        # timeout de conexión
-                # No limitar reintentos internos — PTB maneja reconnect
+                poll_interval=2.0,
+                read_timeout=15,
+                connect_timeout=15,
             )
-            # run_polling() terminó sin exception (parada limpia, e.g. SIGTERM)
-            logger.warning("[polling] run_polling terminó limpiamente (return). Reiniciando...")
+            # Limpio: run_polling() retornó (e.g. SIGTERM)
+            logger.warning("[polling] run_polling terminó limpiamente. Reiniciando...")
             delay = POLL_COOLDOWN_SUCCESS
 
         except Exception:
@@ -169,53 +147,39 @@ def _polling_watchdog() -> None:
         finally:
             _polling_alive = False
 
-        # Si la aplicación existía, intentar shutdown limpio
-        if application:
-            try:
-                # Dar tiempo a PTB para cerrar conexiones
-                pass
-            except Exception:
-                pass
-
         _polling_restarts += 1
-
-        # Backoff exponencial con tope
         wait = min(delay, POLL_MAX_DELAY)
-        logger.info(
-            "[polling] Reinicio #%d en %ds (backoff=%ds)...",
-            _polling_restarts, wait, delay,
-        )
+        logger.info("[polling] Reinicio #%d en %ds...", _polling_restarts, wait)
         time.sleep(wait)
-
-        # Backoff progresivo: duplicar cada vez, hasta el tope
         delay = min(delay * 2, POLL_MAX_DELAY)
 
 
 def main() -> None:
     """Entrypoint principal.
 
-    Main thread → health server (uvicorn.run bloquea).
-    Thread separado → polling watchdog (auto-restart).
+    Main thread = uvicorn /health (bloquea).
+    Thread daemon = polling watchdog (auto-restart).
+    Si el main thread muere → proceso entero muere (daemon threads se cortan).
     """
-    logger.info("[bot] Iniciando bot modular — MODO=%s PORT=%d", MODO, PORT)
+    logger.info("[bot] Iniciando bot — MODO=%s PORT=%d", MODO, PORT)
 
-    # 1) Lanzar polling watchdog en thread NO-daemon (sobrevive al main)
+    # 1) Polling watchdog en thread daemon
+    #    daemon=True: si el main thread muere, el proceso entero sale limpio.
     polling_thread = threading.Thread(
         target=_polling_watchdog,
         name="polling-watchdog",
-        daemon=False,
+        daemon=True,
     )
     polling_thread.start()
-    logger.info("[bot] Polling watchdog lanzado en thread separado")
+    logger.info("[bot] Polling watchdog lanzado (daemon)")
 
-    # 2) Health server en main thread (bloquea aquí — Render necesita proceso vivo)
-    start_health_server()
+    # 2) Health server en main thread (bloquea)
+    logger.info("[health] Iniciando uvicorn en 0.0.0.0:%d", PORT)
+    uvicorn.run(health_app, host="0.0.0.0", port=PORT, log_level="warning")
 
-    # Si llegamos acá, uvicorn terminó (nunca debería pasar en Render)
-    logger.critical("[bot] Health server terminó inesperadamente. Saliendo.")
-    # Forzar salida — Render reiniciará el servicio
-    import os
-    os._exit(1)
+    # Si uvicorn.return (nunca debería en Render), salir forzado
+    logger.critical("[bot] uvicorn terminó. Saliendo.")
+    sys.exit(1)
 
 
 if __name__ == "__main__":
