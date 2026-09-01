@@ -3,7 +3,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 MODO=cloud PYTHONPATH=/app
 
 WORKDIR /app
 COPY requirements-bot.txt ./
-RUN pip install --no-cache-dir -r requirements-bot.txt
+RUN pip install --no-cache-dir -r requirements-bot.txt \
+    && playwright install --with-deps chromium
 
 COPY . .
 EXPOSE 8000

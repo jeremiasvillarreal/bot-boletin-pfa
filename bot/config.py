@@ -1,25 +1,12 @@
 """
 bot.config — Configuración centralizada del bot.
-
-Carga variables desde .env (dotenv) y valida obligatorias.
-Env vars:
-  TELEGRAM_TOKEN  (obligatorio) — token de @BotFather
-  CHROME_CDP_URL  (opcional, default http://localhost:9222)
-  PORT            (opcional, default 8000) — puerto FastAPI /health
-  MODO            (opcional, default local) — local | cloud
-  HF_TOKEN        (opcional) — token HF Fine-grained para resumen IA
-  BOLETIN_PALABRAS (opcional) — lista global comma-separated
-  BOLETIN_NOTIFY_CHAT_ID (opcional) — chat_id destino alertas 07:00/08:00
-  BOT_ADMIN_ID    (opcional) — admin para /boletin_add
 """
 
 import os
 
 from dotenv import load_dotenv
 
-# Cargar .env desde raíz del workspace (y subdirectorios)
 load_dotenv()
-# También intentar cargar desde ubicación relativa al proyecto
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 TELEGRAM_TOKEN: str | None = os.getenv("TELEGRAM_TOKEN")
@@ -42,12 +29,9 @@ except ValueError as exc:
 
 MODO: str = os.getenv("MODO", "local").strip().lower()
 if MODO not in ("local", "cloud"):
-    # No falla duro, solo normaliza; deja warning implícito
     MODO = "local"
 
-# --- Boletín Oficial ---
 HF_TOKEN: str = os.getenv("HF_TOKEN", "").strip()
-# Reuso presentaciones/HF_TOKEN.txt si existe y HF_TOKEN vacío
 if not HF_TOKEN:
     try:
         _hf_path = os.path.join(os.path.dirname(__file__), "..", "presentaciones", "HF_TOKEN.txt")
@@ -63,13 +47,9 @@ BOLETIN_NOTIFY_CHAT_ID: str = os.getenv("BOLETIN_NOTIFY_CHAT_ID", "").strip()
 BOT_ADMIN_ID: str = os.getenv("BOT_ADMIN_ID", "").strip()
 
 def get_boletin_palabras() -> list[str]:
-    """Lista global palabras, re-lee env cada vez para soportar /boletin_add en runtime.
-    Siempre devuelve al menos las palabras por defecto (PFA + Fuerzas de seguridad).
-    """
     raw = os.getenv("BOLETIN_PALABRAS", BOLETIN_PALABRAS)
     if raw and raw.strip():
         return [p.strip() for p in raw.split(",") if p.strip()]
-    # intentar leer de archivo persistente data/boletin_palabras.json
     try:
         import json
         p = os.path.join(os.path.dirname(__file__), "..", "data", "boletin_palabras.json")

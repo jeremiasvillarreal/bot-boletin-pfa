@@ -1,23 +1,26 @@
 """
-bot.main — Entrypoint del Bot Telegram modular 24/7.
+bot.main — Entrypoint del Bot Telegram modular 24/7 (webhook mode).
 
 Arquitectura:
-  - Main thread: Telegram polling (run_polling) con restart loop
-  - Daemon thread: FastAPI /health (uvicorn) para Render + UptimeRobot
+  - FastAPI unificado: /health + /webhook (recibe updates de Telegram)
+  - JobQueue corre via application.start() (async, en el event loop)
+  - Render nunca duerme porque Telegram manda traffic a /webhook
 
 Healthcheck:
   GET /health -> 200 OK
+
+Webhook:
+  POST /webhook -> procesa updates de Telegram
 """
 
+import asyncio
 import logging
-import signal
-import sys
-import threading
-import time
+import os
 from datetime import datetime, timezone
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from telegram import Update
 from telegram.ext import Application
 
 from bot.config import MODO, PORT, TELEGRAM_TOKEN
@@ -25,10 +28,7 @@ from bot.handlers import register_handlers
 from bot.jobs.boletin_scheduler import setup_boletin_jobs
 from bot.jobs.scheduler import setup_jobs
 
-# Timestamp de inicio para /sysinfo
 StartTime = datetime.now(timezone.utc)
-
-# --- Logging ---
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -39,35 +39,12 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-# --- FastAPI health server ---
+# --- Application (se construye una vez) ---
 
-health_app = FastAPI(title="Telegram Bot Health")
-
-
-@health_app.get("/health")
-async def health():
-    """Endpoint para Render healthCheckPath y UptimeRobot."""
-    return {"status": "ok"}
-
-
-@health_app.get("/")
-async def root():
-    """Info básica del bot."""
-    return {"status": "ok", "bot": "telegram-modular", "mode": MODO}
-
-
-def start_health_server() -> threading.Thread:
-    """Lanza uvicorn en thread daemon en puerto PORT."""
-    def _run() -> None:
-        logger.info("[health] FastAPI en 0.0.0.0:%d (/health)", PORT)
-        uvicorn.run(health_app, host="0.0.0.0", port=PORT, log_level="warning")
-    thread = threading.Thread(target=_run, name="health-server", daemon=True)
-    thread.start()
-    return thread
+_application: Application | None = None
 
 
 def build_application() -> Application:
-    """Construye Application de PTB, registra handlers y jobs."""
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -75,58 +52,114 @@ def build_application() -> Application:
         .connect_timeout(15)
         .build()
     )
-
     register_handlers(app)
-    logger.info("[bot] Handlers registrados")
-
     setup_jobs(app)
     setup_boletin_jobs(app)
-    logger.info("[bot] Jobs configurados (scrape_demo + boletin 07/08)")
-
+    logger.info("[bot] Application construida (handlers + jobs)")
     return app
 
 
-def main() -> None:
-    """Entrypoint principal.
+# --- FastAPI ---
 
-    Main thread  → polling Telegram (run_polling + restart loop)
-    Daemon thread → health server FastAPI
-    """
-    logger.info("[bot] Iniciando — MODO=%s PORT=%d", MODO, PORT)
+app = FastAPI(title="Telegram Bot")
 
-    # 1) Health server en thread separado (no bloquea polling)
-    start_health_server()
 
-    # 2) Manejo de señales
-    def _signal_handler(signum, _frame):
-        logger.info("[bot] Señal recibida %s, cerrando...", signal.Signals(signum).name)
+@app.get("/health")
+async def health():
+    uptime = (datetime.now(timezone.utc) - StartTime).total_seconds()
+    return {"status": "ok", "uptime_s": int(uptime), "mode": MODO}
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            signal.signal(sig, _signal_handler)
-        except ValueError:
-            pass
 
-    # 3) Polling con restart automático
-    #    Si run_polling() muere (Render sleep, network, exception),
-    #    reconstruye Application y relanza.
-    restart_count = 0
-    while True:
-        restart_count += 1
-        try:
-            application = build_application()
-            logger.info("[bot] Iniciando polling... (restart #%d)", restart_count)
-            application.run_polling(
-                allowed_updates=None,
-                drop_pending_updates=True,
-            )
-            # Limpio: run_polling retornó
-            logger.warning("[bot] Polling terminó limpiamente. Restart en 10s...")
-        except Exception:
-            logger.exception("[bot] Polling crasheado. Restart en 30s...")
-            time.sleep(30)
-            continue
-        time.sleep(10)
+@app.get("/")
+async def root():
+    uptime = (datetime.now(timezone.utc) - StartTime).total_seconds()
+    return {"status": "ok", "bot": "telegram-modular", "mode": MODO, "uptime_s": int(uptime)}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    """Recibe updates de Telegram y los procesa."""
+    try:
+        data = await request.json()
+        update = Update.de_json(data, _application.bot)
+        await _application.process_update(update)
+    except Exception:
+        logger.exception("[webhook] Error procesando update")
+    return {"ok": True}
+
+
+# --- Startup ---
+
+@app.on_event("startup")
+async def on_startup():
+    global _application
+    logger.info("=" * 50)
+    logger.info("[bot] INICIANDO (webhook mode) — MODO=%s PORT=%d", MODO, PORT)
+    logger.info("=" * 50)
+
+    _application = build_application()
+
+    # Inicializar y arrancar (arranca el JobQueue)
+    await _application.initialize()
+    await _application.start()
+
+    # Construir URL del webhook
+    # Render expone RENDER_EXTERNAL_URL automaticamente
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if render_url:
+        webhook_url = render_url.rstrip("/")
+    else:
+        # Fallback para local: requires WEBHOOK_URL env or localhost
+        webhook_url = os.getenv("WEBHOOK_URL", "").strip()
+
+    if not webhook_url:
+        logger.error(
+            "[bot] No hay WEBHOOK_URL ni RENDER_EXTERNAL_URL. "
+            "Define WEBHOOK_URL en .env (ej: https://tu-app.onrender.com) "
+            "o usa Render que lo inyecta solo."
+        )
+        # En local sin webhook URL, intentar modo polling como fallback
+        logger.info("[bot] Fallback a polling mode (solo para testing local)")
+        _application.drop_pending_updates = True
+        asyncio.create_task(_run_polling_fallback())
+        return
+
+    # Limpiar updates pendientes antes de setear webhook
+    await _application.bot.delete_webhook(drop_pending_updates=True)
+
+    # Setear webhook con Telegram
+    full_webhook_url = f"{webhook_url}/webhook"
+    await _application.bot.set_webhook(
+        url=full_webhook_url,
+        allowed_updates=None,
+    )
+    logger.info("[bot] Webhook seteado: %s", full_webhook_url)
+    logger.info("[bot] Health check: %s/health", webhook_url)
+    logger.info("[bot] Bot listo — Telegram manda updates a /webhook")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    if _application:
+        await _application.stop()
+        await _application.shutdown()
+        logger.info("[bot] Application detenida")
+
+
+async def _run_polling_fallback():
+    """Fallback polling para testing local sin webhook URL."""
+    if _application:
+        logger.info("[bot] Polling fallback iniciado")
+        await _application.run_polling(
+            allowed_updates=None,
+            drop_pending_updates=True,
+        )
+
+
+def main():
+    """Entrypoint: uvicorn sirve FastAPI (health + webhook) en el puerto de Render."""
+    logger.info("[bot] Levantando uvicorn en 0.0.0.0:%d", PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
 
 if __name__ == "__main__":

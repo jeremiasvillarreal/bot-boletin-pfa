@@ -3,7 +3,7 @@ services:
     name: bot-scraper
     env: python
     plan: free
-    dockerCommand: python bot/main.py
+    dockerCommand: python -m bot.main
     healthCheckPath: /health
     envVars:
       - key: TELEGRAM_TOKEN
@@ -20,5 +20,3 @@ services:
         value: 8000
       - key: MODO
         value: cloud
-      - key: CHROME_CDP_URL
-        value: http://localhost:9222
