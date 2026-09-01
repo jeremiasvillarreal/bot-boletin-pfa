@@ -18,6 +18,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from telegram import Update
@@ -29,6 +30,29 @@ from bot.jobs.boletin_scheduler import setup_boletin_jobs
 from bot.jobs.scheduler import setup_jobs
 
 StartTime = datetime.now(timezone.utc)
+SELF_PING_INTERVAL = 600  # 10 minutos (Render Free duerme a los 15)
+
+
+async def _self_ping_loop():
+    """Mantiene vivo el servicio en Render Free haciendo ping a /health."""
+    # Esperar 30s antes del primer ping para que el servidor esté listo
+    await asyncio.sleep(30)
+    ping_url = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if not ping_url:
+        ping_url = os.getenv("SELF_PING_URL", "").strip()
+    if not ping_url:
+        # Si no hay URL externa, intentar localhost (desarrollo local)
+        ping_url = f"http://127.0.0.1:{PORT}"
+    ping_url = ping_url.rstrip("/") + "/health"
+    logger.info("[self-ping] Monitoreando cada %ds -> %s", SELF_PING_INTERVAL, ping_url)
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            await asyncio.sleep(SELF_PING_INTERVAL)
+            try:
+                resp = await client.get(ping_url)
+                logger.info("[self-ping] %s -> %d", ping_url, resp.status_code)
+            except Exception as exc:
+                logger.warning("[self-ping] Error: %s", exc)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -136,6 +160,9 @@ async def on_startup():
     logger.info("[bot] Webhook seteado: %s", full_webhook_url)
     logger.info("[bot] Health check: %s/health", webhook_url)
     logger.info("[bot] Bot listo — Telegram manda updates a /webhook")
+
+    # Self-ping para evitar que Render Free duerma
+    asyncio.create_task(_self_ping_loop())
 
 
 @app.on_event("shutdown")
