@@ -1,8 +1,12 @@
 """
-bot.jobs.boletin_scheduler — Poll Boletin 1ra 07:00 retry 08:00 ART, skip finde/feriado
+bot.jobs.boletin_scheduler — Poll Boletín 1ra cada hora + envío al arranque
 
-Catch-up al arranque: si el bot se reinicia despues de las 07:00 y antes de las 12:00
-en dia habil, ejecuta un poll inmediato para no perder la edicion del dia.
+Flujo:
+  1. Al arranque: scrapea y envía lo último que no se envió antes
+  2. Cada 60 min: scrapea, envía solo avisos nuevos (dedup por ID)
+  3. Skip finde/feriado (no hace requests innecesarias)
+
+Dedup: data/boletin_sent_ids.json guarda IDs de avisos ya enviados.
 """
 
 import json
@@ -16,17 +20,48 @@ from telegram.ext import Application, ContextTypes
 logger = logging.getLogger(__name__)
 BA_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
+SENT_IDS_PATH = os.path.join(DATA_DIR, "boletin_sent_ids.json")
 ULTIMO_PATH = os.path.join(DATA_DIR, "boletin_ultimo.json")
 HASH_PATH = os.path.join(DATA_DIR, "boletin_hash.json")
 FERIADOS_CACHE = os.path.join(DATA_DIR, "feriados_cache.json")
 
-_pending_07 = False
 _last_hash = None
 
 
 def _ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
+
+# --- Persistencia de IDs enviados ---
+
+def _load_sent_ids() -> set[str]:
+    """Carga IDs de avisos ya enviados."""
+    try:
+        if os.path.exists(SENT_IDS_PATH):
+            with open(SENT_IDS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                ids = data.get("ids", [])
+                return set(ids) if isinstance(ids, list) else set()
+    except Exception:
+        pass
+    return set()
+
+
+def _save_sent_ids(sent: set[str]) -> None:
+    """Guarda IDs de avisos enviados."""
+    _ensure_data_dir()
+    try:
+        with open(SENT_IDS_PATH, "w", encoding="utf-8") as f:
+            json.dump({
+                "ids": sorted(sent),
+                "updated": datetime.now(BA_TZ).isoformat(),
+                "count": len(sent),
+            }, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("No se pudo guardar sent_ids: %s", e)
+
+
+# --- Hash de edición (detecta cambios) ---
 
 def _load_hash() -> str | None:
     try:
@@ -56,6 +91,8 @@ def _save_ultimo(fecha: str, hits: int, total: int):
     except Exception:
         pass
 
+
+# --- Helpers ---
 
 async def es_feriado(fecha: date) -> bool:
     if fecha.weekday() >= 5:
@@ -104,38 +141,59 @@ def _hash_avisos(avisos: list[dict]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-async def _enviar_hits(bot, hits, avisos_total: int):
+async def _enviar_hits(bot, hits, avisos_total: int, sent_ids: set[str]) -> int:
+    """Envía hits que no están en sent_ids. Retorna cantidad enviada."""
     from bot.config import HF_TOKEN
     from scraper.boletin import resumir_ia, scrape_detalle
+
     chat_ids = await _get_notificar_chat_ids()
     if not chat_ids:
         logger.warning("No hay BOLETIN_NOTIFY_CHAT_ID, no se notifica")
-        return
-    for h in hits[:5]:
-        detalle = await scrape_detalle(h.url)
-        resumen = await resumir_ia(detalle, h.titulo, HF_TOKEN)
-        msg = (
-            f"🔔 *Boletín Oficial 1ra - {h.fecha or datetime.now(BA_TZ).strftime('%d/%m/%Y')}*\n"
-            f"📌 *{h.titulo[:140]}*\n"
-            f"🔑 Coincide: `{', '.join(h.matched)}`\n"
-            f"📝 _{resumen[:850]}_\n"
-            f"🔗 {h.url}\n"
-            f"_{avisos_total} avisos hoy_"
-        )
+        return 0
+
+    enviados = 0
+    for h in hits:
+        if h.id in sent_ids:
+            continue
+        if enviados >= 10:
+            break
+
+        try:
+            detalle = await scrape_detalle(h.url)
+            resumen = await resumir_ia(detalle, h.titulo, HF_TOKEN)
+            msg = (
+                f"🔔 *Boletín Oficial 1ra - {h.fecha or datetime.now(BA_TZ).strftime('%d/%m/%Y')}*\n"
+                f"📌 *{h.titulo[:140]}*\n"
+                f"🔑 Coincide: `{', '.join(h.matched)}`\n"
+                f"📝 _{resumen[:850]}_\n"
+                f"🔗 {h.url}\n"
+                f"_{avisos_total} avisos hoy_"
+            )
+            for cid in chat_ids:
+                try:
+                    await bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning("No se pudo notificar %s: %s", cid, e)
+            sent_ids.add(h.id)
+            enviados += 1
+        except Exception as e:
+            logger.warning("Error enviando hit %s: %s", h.id, e)
+
+    if len(hits) > enviados and enviados > 0:
         for cid in chat_ids:
             try:
-                await bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
-            except Exception as e:
-                logger.warning("No se pudo notificar %s: %s", cid, e)
-    if len(hits) > 5:
-        for cid in chat_ids:
-            try:
-                await bot.send_message(chat_id=cid, text=f"… y {len(hits)-5} coincidencias más hoy")
+                await bot.send_message(chat_id=cid,
+                    text=f"… y {len(hits) - enviados} coincidencias más (ya enviadas anteriormente)")
             except Exception:
                 pass
 
+    return enviados
 
-async def poll_boletin_once(bot, force_notify: bool = False, chat_id: str | None = None) -> str:
+
+# --- Core: scrape + filter + dedup ---
+
+async def _procesar_nuevos(bot, force_notify: bool = False, chat_id: str | None = None) -> str:
+    """Scrapea 1ra, filtra por palabras, retorna string con resultado."""
     from bot.config import get_boletin_palabras
     from scraper.boletin import filtrar_por_palabras, scrape_primera
 
@@ -149,15 +207,6 @@ async def poll_boletin_once(bot, force_notify: bool = False, chat_id: str | None
 
     avisos = await scrape_primera(hoy)
     if not avisos:
-        if force_notify:
-            target = chat_id or (await _get_notificar_chat_ids())[0] if (await _get_notificar_chat_ids()) else None
-            if target:
-                try:
-                    await bot.send_message(chat_id=target,
-                        text=f"⚠️ Sin avisos 1ra hoy {hoy.strftime('%d/%m')} (¿aún no publicado o feriado?). Reintento 08:00.",
-                        parse_mode="Markdown")
-                except Exception:
-                    pass
         _save_ultimo(hoy.isoformat(), 0, 0)
         return "sin avisos (posible no publicado)"
 
@@ -165,113 +214,73 @@ async def poll_boletin_once(bot, force_notify: bool = False, chat_id: str | None
     global _last_hash
     if _last_hash is None:
         _last_hash = _load_hash()
-    if not force_notify and _last_hash == h:
+
+    sent_ids = _load_sent_ids()
+    hits = filtrar_por_palabras(avisos, palabras) if palabras else []
+
+    # Filtrar solo los que no se enviaron antes
+    nuevos = [hit for hit in hits if hit.id not in sent_ids]
+
+    if not nuevos:
         _save_ultimo(hoy.isoformat(), 0, len(avisos))
+        if hits:
+            return f"0 nuevos de {len(hits)} hits ({len(avisos)} avisos, ya enviados)"
         return f"sin cambios ({len(avisos)} avisos)"
 
-    _last_hash = h
-    _save_hash(h, hoy.isoformat())
-
-    if not palabras:
-        palabras = ["(test)"]
-        hits = filtrar_por_palabras(avisos, palabras) if not force_notify else []
-        _save_ultimo(hoy.isoformat(), len(hits), len(avisos))
-        return f"sin palabras configuradas, {len(avisos)} avisos"
-
-    hits = filtrar_por_palabras(avisos, palabras)
-    _save_ultimo(hoy.isoformat(), len(hits), len(avisos))
-
-    if hits:
-        if force_notify and chat_id:
-            from bot.config import HF_TOKEN
-            from scraper.boletin import resumir_ia, scrape_detalle
-            for hit in hits[:3]:
+    # Hay nuevos: enviar
+    enviados = 0
+    if force_notify and chat_id:
+        from bot.config import HF_TOKEN
+        from scraper.boletin import resumir_ia, scrape_detalle
+        for hit in nuevos[:5]:
+            if hit.id in sent_ids:
+                continue
+            try:
                 det = await scrape_detalle(hit.url)
                 res = await resumir_ia(det, hit.titulo, HF_TOKEN)
-                msg = f"🔔 *{hit.titulo[:130]}*\n🔑 `{', '.join(hit.matched)}`\n📝 {res[:800]}\n🔗 {hit.url}"
-                try:
-                    await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-                except Exception:
-                    pass
-            return f"{len(hits)} hits (notificado a {chat_id})"
-        else:
-            await _enviar_hits(bot, hits, len(avisos))
-            return f"{len(hits)} hits notificados"
-    else:
-        if force_notify and chat_id:
-            try:
-                await bot.send_message(chat_id=chat_id,
-                    text=f"✅ Boletín hoy {hoy.strftime('%d/%m')}: {len(avisos)} avisos, 0 coincidencias para `{', '.join(palabras)}`")
-            except Exception:
-                pass
-        return f"0 hits de {len(avisos)}"
-
-
-async def _job_07(context: ContextTypes.DEFAULT_TYPE):
-    global _pending_07
-    hoy = datetime.now(BA_TZ).date()
-    if await es_feriado(hoy):
-        _pending_07 = False
-        return
-    from bot.config import get_boletin_palabras
-    if not get_boletin_palabras():
-        return
-    from scraper.boletin import scrape_primera
-    avisos = await scrape_primera(hoy)
-    if not avisos:
-        logger.info("[boletin] 07:00 sin edicion aun, retry 08:00")
-        _pending_07 = True
-        return
-    _pending_07 = False
-    result = await poll_boletin_once(context.bot, force_notify=False)
-    logger.info("[boletin] 07:00 result %s", result)
-
-
-async def _job_08(context: ContextTypes.DEFAULT_TYPE):
-    global _pending_07
-    hoy = datetime.now(BA_TZ).date()
-    if await es_feriado(hoy):
-        _pending_07 = False
-        return
-    from bot.config import get_boletin_palabras
-    if not get_boletin_palabras():
-        return
-    if not _pending_07:
-        result = await poll_boletin_once(context.bot, force_notify=False)
-        logger.info("[boletin] 08:00 (no pending) check %s", result)
-        return
-    _pending_07 = False
-    from scraper.boletin import scrape_primera
-    avisos = await scrape_primera(hoy)
-    if not avisos:
-        chat_ids = await _get_notificar_chat_ids()
-        for cid in chat_ids:
-            try:
-                await context.bot.send_message(chat_id=cid,
-                    text=f"⚠️ *Boletín 1ra sin publicación al 08:00 ART* hoy {hoy.strftime('%d/%m/%Y')}. Reintento mañana 07:00.",
-                    parse_mode="Markdown")
+                msg = (
+                    f"🔔 *{hit.titulo[:130]}*\n"
+                    f"🔑 `{', '.join(hit.matched)}`\n"
+                    f"📝 {res[:800]}\n"
+                    f"🔗 {hit.url}"
+                )
+                await bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+                sent_ids.add(hit.id)
+                enviados += 1
             except Exception as e:
-                logger.warning("08:00 notify fallo %s", e)
-        return
-    result = await poll_boletin_once(context.bot, force_notify=False)
-    logger.info("[boletin] 08:00 retry result %s", result)
+                logger.warning("Error notificando %s: %s", hit.id, e)
+    else:
+        enviados = await _enviar_hits(bot, nuevos, len(avisos), sent_ids)
+
+    _save_sent_ids(sent_ids)
+    _save_ultimo(hoy.isoformat(), enviados, len(avisos))
+
+    if _last_hash != h:
+        _last_hash = h
+        _save_hash(h, hoy.isoformat())
+
+    return f"{enviados} nuevos enviados de {len(hits)} hits ({len(avisos)} avisos)"
 
 
-async def _catchup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Ejecuta un poll inmediato al arranque si es dia habil y estamos entre 07:15 y 12:00.
-    Evita perder la edicion si el bot se reinicio despues de las 07:00."""
-    now = datetime.now(BA_TZ)
-    hoy = now.date()
-    hora = now.hour
+# --- Jobs ---
 
-    if await es_feriado(hoy):
-        return
-    if hora < 7 or hora >= 12:
-        return
+async def _job_startup(context: ContextTypes.DEFAULT_TYPE):
+    """Al arranque: envía todo lo nuevo sin importar la hora."""
+    logger.info("[boletin] Startup job ejecutando — enviando contenido nuevo")
+    result = await _procesar_nuevos(context.bot, force_notify=False)
+    logger.info("[boletin] Startup result: %s", result)
 
-    logger.info("[boletin] Catch-up arranque: dia habil %s, hora %d:%d — ejecutando poll", hoy, hora, now.minute)
-    result = await poll_boletin_once(context.bot, force_notify=False)
-    logger.info("[boletin] Catch-up result: %s", result)
+
+async def _job_hourly(context: ContextTypes.DEFAULT_TYPE):
+    """Cada 60 min: scrapea, envía solo avisos nuevos."""
+    logger.info("[boletin] Hourly job ejecutando")
+    result = await _procesar_nuevos(context.bot, force_notify=False)
+    logger.info("[boletin] Hourly result: %s", result)
+
+
+async def boletin_check_manual(bot, force_notify: bool = False, chat_id: str | None = None) -> str:
+    """Check manual (desde /boletin_check). Retorna string status."""
+    return await _procesar_nuevos(bot, force_notify=force_notify, chat_id=chat_id)
 
 
 def setup_boletin_jobs(application: Application) -> None:
@@ -279,10 +288,10 @@ def setup_boletin_jobs(application: Application) -> None:
         logger.warning("[boletin] JobQueue no disponible")
         return
 
-    application.job_queue.run_daily(_job_07, time(hour=7, minute=0, tzinfo=BA_TZ), name="boletin_07")
-    application.job_queue.run_daily(_job_08, time(hour=8, minute=0, tzinfo=BA_TZ), name="boletin_08")
-    logger.info("[boletin] Jobs 07:00 y 08:00 ART registrados")
+    # Startup: envía lo nuevo a los 20s del arranque
+    application.job_queue.run_once(_job_startup, when=20, name="boletin_startup")
+    logger.info("[boletin] Startup job: envía contenido nuevo a los 20s")
 
-    # Catch-up: poll inmediato a los 15s del arranque si es dia habil 07:15-12:00
-    application.job_queue.run_once(_catchup_job, when=15, name="boletin_catchup")
-    logger.info("[boletin] Catch-up job programado a los 15s del arranque")
+    # Hourly: cada 60 min
+    application.job_queue.run_repeating(_job_hourly, interval=3600, first=3620, name="boletin_hourly")
+    logger.info("[boletin] Hourly job: cada 60 min (primero a los ~60 min)")
