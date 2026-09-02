@@ -333,143 +333,193 @@ async def filtrar_por_palabras_full(avisos: list[dict], palabras: list[str], max
             seen.add(h.id)
             uniq.append(h)
     return uniq
-def _resumen_extractivo(texto: str, titulo: str = "") -> str:
-    """Resumen claro en 1-2 oraciones para normativa del Boletín Oficial.
 
-    Estrategia: buscar la frase con verbo legal + scoring por datos concretos.
-    """
+def _resumen_extractivo(texto: str, titulo: str = "") -> str:
+    """Resumen claro en 1-2 oraciones: de qué trata la norma."""
     if not texto or len(texto.strip()) < 50:
         texto = titulo
-    txt = texto.replace("\n", " ").replace("\r", " ").strip()
+    import re
+    txt = texto.replace("\n", " ").strip()
     txt = txt.replace("�", " ")
     txt = re.sub(r"\s+", " ", txt)
     frases = re.split(r"(?<=[\.。])\s+", txt)
 
-    todos_verbos = [
-        "dispone", "establece", "fija", "determina", "reglamenta",
-        "otorg", "conced", "asigna", "adjudica", "suma fija", "bonif",
-        "autoriza", "habilita", "permite", "aprueba",
-        "designa", "nombr", "remueve", "separa", "cesa",
-        "crea", "constit", "instaura", "modifica", "deroga", "suspende",
-        "declara", "reconoce", "resuelve",
-    ]
-
-    mejor_frase = ""
-    mejor_score = 0
+    # 1) Buscar frase clave que resuma el objeto (otorga, dispone, autoriza, crea, modifica)
+    palabras_clave = ["otorg", "dispone", "autoriza", "crea", "modifica", "establece",
+                       "aprueba", "designa", "remueve", "suma fija", "bonif", "asigna",
+                       "declara", "reconoce", "resuelve"]
+    frase_objeto = ""
     for f in frases:
-        fl = f.lower().strip()
-        if len(fl) < 15:
-            continue
-        score = 0
-        for v in todos_verbos:
-            if v in fl:
-                score += 2
-                break
-        if re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", fl):
-            score += 1
-        if re.search(r"\$|pesos|USD|U\$S", fl):
-            score += 1
-        if re.search(r"art[íi]culo|ley|decreto|resoluci[oó]n|disposici[oó]n", fl):
-            score += 1
-        if score > mejor_score:
-            mejor_score = score
-            mejor_frase = f.strip()
+        fl = f.lower()
+        if any(k in fl for k in palabras_clave):
+            frase_objeto = re.sub(r"\s+", " ", f.strip())
+            break
 
-    if not mejor_frase or mejor_score < 2:
-        sustanciales = [f.strip() for f in frases if len(f.strip()) > 25]
-        if sustanciales:
-            mejor_frase = ". ".join(sustanciales[:2])
-
+    # 2) Armar una oración clara: qué hace + a quién
     partes = []
     if titulo:
-        partes.append(titulo.strip()[:150])
-    if mejor_frase:
-        if len(mejor_frase) > 350:
-            mejor_frase = mejor_frase[:350].rstrip()
-            last_dot = mejor_frase.rfind(".")
-            if last_dot > 100:
-                mejor_frase = mejor_frase[:last_dot + 1]
-            else:
-                mejor_frase += "…"
-        partes.append(mejor_frase)
-    elif txt:
-        partes.append(txt[:400])
+        partes.append(titulo.strip()[:140])
 
-    resumen = " — ".join(partes) if len(partes) > 1 else (partes[0] if partes else txt[:400])
+    if frase_objeto:
+        # recortar a 2 oraciones como mucho
+        if len(frase_objeto) > 300:
+            frase_objeto = frase_objeto[:300].rstrip() + "…"
+        partes.append(frase_objeto)
+    else:
+        # tomar las 2 frases más relevantes
+        rel = [f.strip() for f in frases if len(f.strip()) > 30][:3]
+        if rel:
+            partes.append(". ".join(rel)[:400])
+        else:
+            partes.append(txt[:400])
+
+    resumen = " — ".join(partes) if len(partes) > 1 else partes[0]
     return resumen[:950]
 
-
 async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) -> str:
-    """Resumen en 1-2 oraciones: de qué trata la norma del Boletín Oficial.
+    """Resumen real en 1-2 oraciones: de qué trata la norma del Boletín Oficial.
 
-    Cadena: Qwen2.5-3B (generativo, rápido) → bart-large-cnn (extractivo) → extractivo local.
+    Proveedores LLM (en orden de prioridad):
+      1. Groq (Llama 3.3 70B) — más inteligente, ultrarrápido
+      2. Cerebras (Qwen3/Llama) — fallback alto volumen
+      3. HuggingFace Mistral-7B — respaldo
+      4. Extractivo local — último recurso sin IA
     """
     if not texto or len(texto.strip()) < 50:
         texto = titulo
     texto = texto[:7000]
 
-    if not (hf_token and hf_token.strip().startswith("hf_")):
-        return _resumen_extractivo(texto, titulo)
+    # Cargar keys desde env o archivos .txt
+    import os
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_key:
+        try:
+            p = os.path.join(os.path.dirname(__file__), "..", "GROQ_API_KEY.txt")
+            if os.path.exists(p):
+                groq_key = open(p, encoding="utf-8").read().strip()
+        except Exception:
+            pass
 
-    token = hf_token.strip()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    cerebras_key = os.getenv("CEREBRAS_API_KEY", "").strip()
+    if not cerebras_key:
+        try:
+            p = os.path.join(os.path.dirname(__file__), "..", "CEREBRAS_API_KEY.txt")
+            if os.path.exists(p):
+                cerebras_key = open(p, encoding="utf-8").read().strip()
+        except Exception:
+            pass
 
-    # 1) Qwen2.5-3B-Instruct — rápido, buen español, formato chat
-    try:
-        url = "https://router.huggingface.co/hf-inference/models/Qwen/Qwen2.5-3B-Instruct"
-        messages = [
-            {"role": "system", "content": (
-                "Sos un asistente que resume normas del Boletín Oficial argentino. "
-                "Escribí UNA sola oración clara en español que explique qué hace la norma, "
-                "a quién va dirigida y qué habilita. Sé directo, sin intro ni conclusión."
-            )},
-            {"role": "user", "content": f"Título: {titulo}\n\nTexto de la norma:\n{texto[:2500]}"}
-        ]
-        payload = {
-            "messages": messages,
-            "parameters": {"max_new_tokens": 150, "temperature": 0.2}
-        }
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                gen = ""
-                if isinstance(data, list) and data:
-                    gen = data[0].get("generated_text", "")
-                elif isinstance(data, dict):
-                    gen = data.get("generated_text", "")
-                gen = gen.strip()
-                gen = re.sub(
-                    r"^(Resumen:|La norma|Esta norma|El decreto|Según|De acuerdo)\s*",
-                    "", gen, flags=re.I
-                ).strip()
-                if gen and len(gen) > 25:
-                    return gen[:950]
-    except Exception as e:
-        logging.getLogger(__name__).debug("Qwen falló: %s", e)
+    prompt = (
+        "Sos un asistente legal argentino. Escribí UNA sola oración en español rioplatense "
+        "que resuma de qué trata esta norma del Boletín Oficial. Sé claro y directo. "
+        "Solo la oración, sin intro ni explicación.\n\n"
+        f"Título: {titulo}\n"
+        f"Texto: {texto[:3000]}"
+    )
 
-    # 2) bart-large-cnn — extractivo como respaldo
-    try:
-        url2 = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
-        payload2 = {
-            "inputs": texto[:2200],
-            "parameters": {"max_length": 130, "min_length": 25, "do_sample": False},
-        }
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp2 = await client.post(url2, headers=headers, json=payload2)
-            if resp2.status_code == 200:
-                data2 = resp2.json()
-                summ = None
-                if isinstance(data2, list) and data2:
-                    summ = data2[0].get("summary_text", "").strip()
-                elif isinstance(data2, dict):
-                    summ = data2.get("summary_text", "").strip()
-                if summ and len(summ) > 30:
-                    return summ[:950]
-    except Exception:
-        pass
+    # 1) Groq — Llama 3.3 70B (más inteligente, ~300-1000 tok/s)
+    if groq_key:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "llama-3.3-70b-versatile",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 150,
+                        "temperature": 0.2,
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    gen = data["choices"][0]["message"]["content"].strip()
+                    gen = re.sub(r"^(Resumen:|La norma|Esta norma|El decreto)\s*", "", gen, flags=re.I).strip()
+                    if gen and len(gen) > 30:
+                        return gen[:950]
+                else:
+                    logging.getLogger(__name__).debug("Groq %s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logging.getLogger(__name__).debug("Groq falló: %s", e)
 
-    # 3) Fallback: extractivo mejorado (local, siempre funciona)
+    # 2) Cerebras — Qwen3/Llama (fallback, ~1M tokens/día)
+    if cerebras_key:
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    "https://api.cerebras.ai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {cerebras_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "llama-3.3-70b",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 150,
+                        "temperature": 0.2,
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    gen = data["choices"][0]["message"]["content"].strip()
+                    gen = re.sub(r"^(Resumen:|La norma|Esta norma|El decreto)\s*", "", gen, flags=re.I).strip()
+                    if gen and len(gen) > 30:
+                        return gen[:950]
+                else:
+                    logging.getLogger(__name__).debug("Cerebras %s: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            logging.getLogger(__name__).debug("Cerebras falló: %s", e)
+
+    # 3) HuggingFace Mistral — respaldo (ya existente)
+    if hf_token and hf_token.strip().startswith("hf_"):
+        token = hf_token.strip()
+        headers_hf = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        try:
+            url = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.3"
+            hf_prompt = (
+                f"[INST] Escribí UNA sola oración en español rioplatense que resuma de qué trata "
+                f"esta norma del Boletín Oficial. Sé claro y directo. Solo la oración, sin intro.\n\n"
+                f"Título: {titulo}\n"
+                f"Texto: {texto[:2000]} [/INST]"
+            )
+            payload = {"inputs": hf_prompt, "parameters": {"max_new_tokens": 150, "temperature": 0.2}}
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(url, headers=headers_hf, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    gen = ""
+                    if isinstance(data, list) and data and "generated_text" in data[0]:
+                        gen = data[0]["generated_text"]
+                    elif isinstance(data, dict) and "generated_text" in data:
+                        gen = data["generated_text"]
+                    if "[/INST]" in gen:
+                        gen = gen.split("[/INST]")[-1].strip()
+                    gen = re.sub(r"^(Resumen:|La norma|Esta norma|El decreto)\s*", "", gen, flags=re.I).strip()
+                    if gen and len(gen) > 30:
+                        return gen[:950]
+        except Exception as e:
+            logging.getLogger(__name__).debug("HuggingFace Mistral falló: %s", e)
+
+    # 4) bart-large-cnn — respaldo extractivo con IA
+    if hf_token and hf_token.strip().startswith("hf_"):
+        try:
+            url2 = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
+            payload2 = {
+                "inputs": texto[:2200],
+                "parameters": {"max_length": 130, "min_length": 25, "do_sample": False},
+            }
+            async with httpx.AsyncClient(timeout=25.0) as client:
+                resp2 = await client.post(url2, headers=headers_hf, json=payload2)
+                if resp2.status_code == 200:
+                    data2 = resp2.json()
+                    summ = None
+                    if isinstance(data2, list) and data2 and "summary_text" in data2[0]:
+                        summ = data2[0]["summary_text"].strip()
+                    elif isinstance(data2, dict) and "summary_text" in data2:
+                        summ = data2["summary_text"].strip()
+                    if summ and len(summ) > 30:
+                        return summ[:950]
+        except Exception:
+            pass
+
+    # 5) Fallback: extractivo propio (sin IA)
     return _resumen_extractivo(texto, titulo)
 
 # CLI para testing

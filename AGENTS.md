@@ -34,24 +34,59 @@ Formato de pregunta: 2-3 opciones cortas, primera = recomendada. Ej:
 ## 3. Rutas con espacios
 Siempre quotear paths: `"C:\Users\jerem\Desktop\Nueva carpeta\..."` en bash (PowerShell 5.1).
 
-## 4. Capacidad instalada — SCRAPING + BOTS TELEGRAM + HOSTING 24/7 GRATUITO (actualizado 2026-08-27)
+## 4. Capacidad instalada — SCRAPING + BOTS TELEGRAM + IA + VIDEO + AUDIO (actualizado 2026-09-02)
 
 > **Stack operativo:** Playwright Python CDP (`chrome --remote-debugging-port=9222`) + `python-telegram-bot==20.7` modular + `FastAPI /health` + `Render Free` (sin tarjeta) + `UptimeRobot` keep-alive. **Modo multi-agente PERMANENTE ACTIVO para TODOS los pedidos:** todo pedido se delega en subagentes especializados (scraper / bot / devops / frontend / backend / presentaciones) y el agente principal supervisa integración y calidad.
 
+### 4a. Scraping y crawling
 - **Chrome debug (local, Windows):** `& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir=".chrome-debug"` -> verificar `http://localhost:9222/json/version`. Código: `scraper/base.py` hace `connect_over_cdp("http://localhost:9222")` si responde, else `launch(headless=True)` para nube.
-- **Scraping:** `playwright`, `beautifulsoup4`, `lxml`, `httpx`, `pydantic` (datos públicos/APIs). Plantilla: `scraper/ejemplo_publico.py`. Flujo: local debug -> prod headless sin cambios.
+- **Scraping clásico:** `playwright`, `beautifulsoup4`, `lxml`, `httpx`, `pydantic` (datos públicos/APIs). Plantilla: `scraper/ejemplo_publico.py`. Flujo: local debug -> prod headless sin cambios.
+- **Crawling con IA (nuevo):** `crawl4ai==0.9.2` — crawler web optimizado para LLMs. Extrae contenido limpio/estructurado de páginas. Uso: `from crawl4ai import AsyncWebCrawler`. Requiere `playwright install` la primera vez para descargar navegadores. Ideal para RAG, extracción masiva de contenido, alimentar embeddings.
+
+### 4b. Audio y transcripción
+- **Transcripción de audio (nuevo):** `faster-whisper==1.2.1` — Whisper CTranslate2, ~4x más rápido que openai-whisper, menor consumo de RAM. Uso: `from faster_whisper import WhisperModel; model = WhisperModel("large-v3"); segments, info = model.transcribe("audio.mp3")`. Soporta CPU y GPU. Modelos: `tiny`, `base`, `small`, `medium`, `large-v3`.
+- **Speech-to-text existente:** `openai-whisper==20250625` (más lento pero funcional como fallback).
+- **Text-to-speech:** `gTTS==2.5.4` (online), `pyttsx3==2.99` (offline).
+
+### 4c. Video programático (nuevo)
+- **Remotion 4.0.518** — Framework React para crear videos MP4/audios/imágenes de forma programática. Comandos: `npx remotion studio` (preview), `npx remotion render <entry> <comp> <output.mp4>`, `npx remotion still <entry> <comp> <still.png>`. Entry point: archivos `.tsx` con componentes React. Uso ideal: generar videos dinámicos, presentaciones animadas, contenido para redes.
+- **Video existente:** `moviepy==2.2.1` + `imageio-ffmpeg` (corte/edición básica de video con Python).
+
+### 4d. Imágenes y eliminación de fondos
+- **rembg (actualizado):** Eliminación de fondos con IA (`u2net`, `isnet-anime`, etc.). Uso: `from rembg import remove; output = remove(input_image)`. Funciona offline.
+- **Generación de imágenes:** SDXL/FLUX vía API HuggingFace (sección 5).
+
+### 4f. LLM APIs gratuitas (actualizado 2026-09-02)
+
+> **APIs de IA gratuitas sin tarjeta de crédito, disponibles para proyectos.** Keys guardadas en archivos `.txt` en la raíz del workspace.
+
+| Proveedor | Key file | Modelos principales | Límites free | API compatible | Uso ideal |
+|---|---|---|---|---|---|
+| **Groq** | `GROQ_API_KEY.txt` | Llama 3.3 70B, GPT-OSS 120B, Qwen3 | 30 RPM, 1,000 RPD, 6K-12K TPM | OpenAI-compatible | RAG, chat, generación de texto, velocidad máxima (~300-1000 tok/s) |
+| **Cerebras** | `CEREBRAS_API_KEY.txt` | Qwen3 235B, Llama 3.3 70B | 30 RPM, ~1M tokens/día | OpenAI-compatible | Fallback de Groq, alto volumen, procesamiento por lotes |
+| **HuggingFace** | `presentaciones/HF_TOKEN.txt` | Modelos OSS variables (bart-large-cnn, SDXL, etc.) | Rate-limited comunitario | Parcial | Resúmenes IA (ya en uso en `boletin.py`), generación de imágenes |
+
+**Patrón de uso:** Para nuevos proyectos que necesiten LLM → usar Groq como principal, Cerebras como fallback. HuggingFace se mantiene para resúmenes del boletín y generación de imágenes. Las keys se cargan desde archivos `.txt` en la raíz (mismo patrón que `HF_TOKEN.txt`).
+
+**Ejemplo carga en config.py:**
+```python
+GROQ_API_KEY: str = open(os.path.join(os.path.dirname(__file__), "..", "GROQ_API_KEY.txt")).read().strip()
+CEREBRAS_API_KEY: str = open(os.path.join(os.path.dirname(__file__), "..", "CEREBRAS_API_KEY.txt")).read().strip()
+```
+
+### 4e. Bots Telegram y hosting
 - **Bots Telegram:** `bot/main.py` (Application PTB polling + JobQueue) + `bot/handlers/` (`start`, `scraper`, `utilidades`) + `bot/jobs/scheduler.py`. Modular: cada nuevo bot = nuevo handler. Health endpoint `GET /health` en thread `uvicorn` puerto `8000`/`PORT`.
 - **Hosting 24/7 gratuito SIN tarjeta (elegido):** `Render Free` (750h/mes, sleep 15min) + `UptimeRobot` ping cada 5min a `/health` = 24/7 real. Alternativa `Koyeb Free`/`PythonAnywhere` descartadas para polling. `Fly.io`/`Oracle` requieren tarjeta (no usar si usuario exige sin tarjeta).
 - **Deploy:** `GitHub -> Render` auto-deploy, `Dockerfile` python:3.12-slim + `playwright install`, `render.yaml` healthCheckPath `/health`, secrets via `TELEGRAM_TOKEN` en dashboard Render.
 - **Env:** `.env.example` -> `TELEGRAM_TOKEN`, `CHROME_CDP_URL`, `PORT`, `MODO`. `.env` gitignored.
 - **Uso rápido:** usuario dice `creame un bot que haga X` -> agregar handler en `bot/handlers/` + job si necesita scraping + `git push`. No re-configurar nube.
-- **Delegación FREE por fortaleza (solo modelos `*-free`, actualizado 2026-08-27):**
+- **Delegación FREE por fortaleza (solo modelos `*-free`, actualizado 2026-08-30):**
   | Modelo | Rol | Usar cuando |
   |---|---|---|
   | `opencode/mimo-v2.5-free` | **Visión** | Leer imágenes, OCR, screenshots, diagramas, validar slides (`presentaciones/`, `paint_screenshot.png`) |
-  | `opencode/nemotron-3-ultra-free` | **Razonamiento/Arquitectura** | Scraping complejo, decisiones infra, jobs async |
+  | `opencode/nemotron-3-ultra-free` | **Razonamiento/Arquitectura** | Scraping complejo (`crawl4ai`), decisiones infra, jobs async |
   | `opencode/nemotron-3.5-lightning-free` | **Micro-tareas rápidas** | Handlers simples (`/ping`/`/eco`), fixes chicos |
-  | `opencode/big-pickle` | **Código creativo** | PPTX/ilustraciones, `material/build_libro.py`, animaciones |
+  | `opencode/big-pickle` | **Código creativo** | PPTX/ilustraciones, `material/build_libro.py`, animaciones, Remotion `.tsx` |
   | `opencode/hy3-free` | **Búsqueda/embeddings** | RAG en `material/`, indexado |
   | `opencode/muse-spark-1.2-contributor-free` | **Supervisor** | Coordina subagentes, valida `scraper/base.py`/`bot/main.py`, integra deploy |
   Regla: para cada pedido el supervisor elige modelo según tabla, siempre free. Si hay imagen -> obligatoriamente `mimo`.

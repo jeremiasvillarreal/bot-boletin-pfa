@@ -58,24 +58,14 @@ async def boletin_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 ultimo = data.get("fecha", "?") + " hits=" + str(data.get("hits", "?"))
     except Exception:
         pass
-    # contar enviados
-    sent_count = 0
-    sent_path = os.path.join(os.path.dirname(__file__), "..", "..", "data", "boletin_sent_ids.json")
-    try:
-        if os.path.exists(sent_path):
-            with open(sent_path, "r", encoding="utf-8") as f:
-                sent_count = json.load(f).get("count", 0)
-    except Exception:
-        pass
     now = datetime.now(BA_TZ).strftime("%Y-%m-%d %H:%M %Z")
     txt = (
-        "📋 *Boletín Oficial 1ra* — automático cada 60 min\n"
+        "📋 *Boletín Oficial 1ra+3ra* — modo manual `go`\n"
         f"🕐 Ahora: `{now}`\n"
-        f"🔄 Check: cada *60 min* + al arranque\n"
+        f"▶️ `go` (hoy) o `go DD/MM/AAAA`\n"
         f"🔑 Palabras: `{', '.join(palabras)}`\n"
         f"📊 Último: {ultimo}\n"
-        f"📤 Enviados (dedup): `{sent_count}` avisos\n"
-        f"💡 Comandos: `go` (manual) · `go DD/MM/AAAA` (fecha)"
+        f"💡 Tip: `go 03/08/2026` busca esa fecha"
     )
     await update.message.reply_text(txt, parse_mode="Markdown")
 
@@ -158,14 +148,11 @@ async def boletin_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_text(f"❌ Error test: {e}")
 
 async def boletin_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("⏳ Forzando check manual del Boletín…")
+    # fuerza poll del scheduler (reusa lógica)
+    await update.message.reply_text("⏳ Forzando poll 07:00 (feriado/finde check + scrape)…")
     try:
-        from bot.jobs.boletin_scheduler import boletin_check_manual
-        result = await boletin_check_manual(
-            context.bot,
-            force_notify=True,
-            chat_id=str(update.effective_chat.id) if update.effective_chat else None,
-        )
+        from bot.jobs.boletin_scheduler import poll_boletin_once
+        result = await poll_boletin_once(context.bot, force_notify=True, chat_id=str(update.effective_chat.id) if update.effective_chat else None)
         await update.message.reply_text(f"✅ Check done: {result}")
     except Exception as e:
         logger.exception("boletin_check error")
