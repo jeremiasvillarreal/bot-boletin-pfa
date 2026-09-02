@@ -228,9 +228,9 @@ async def go_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"✅ {len(hits)} hit(s) de {len(avisos)} avisos del {label} (1ra+3ra) — generando resumen IA…")
         for h in hits[:6]:
             # detalle ya está en preview si vino de filtrado full, sino fetch
-            detalle = h.preview if len(h.preview) > 200 else await scrape_detalle(h.url)
-            if len(detalle) < 200:
-                detalle = await scrape_detalle(h.url)
+            detalle = await scrape_detalle(h.url)
+            if not detalle or len(detalle) < 200:
+                detalle = h.preview
             resumen = await resumir_ia(detalle, h.titulo, HF_TOKEN)
             sec = "1ra" if h.seccion=="primera" else "3ra"
             msg = (
