@@ -439,7 +439,7 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
                     json={
-                        "model": "llama-3.3-70b-versatile",
+                        "model": "openai/gpt-oss-120b",
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": 150,
                         "temperature": 0.2,
@@ -464,7 +464,7 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
                     "https://api.cerebras.ai/v1/chat/completions",
                     headers={"Authorization": f"Bearer {cerebras_key}", "Content-Type": "application/json"},
                     json={
-                        "model": "llama-3.3-70b",
+                        "model": "gpt-oss-120b",
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": 150,
                         "temperature": 0.2,
