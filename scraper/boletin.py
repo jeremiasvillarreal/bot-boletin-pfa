@@ -393,21 +393,31 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
     import os
     groq_key = os.getenv("GROQ_API_KEY", "").strip()
     if not groq_key:
-        try:
-            p = os.path.join(os.path.dirname(__file__), "..", "GROQ_API_KEY.txt")
-            if os.path.exists(p):
-                groq_key = open(p, encoding="utf-8").read().strip()
-        except Exception:
-            pass
+        for p in [
+            os.path.join(os.path.dirname(__file__), "..", "GROQ_API_KEY.txt"),
+            "/etc/secrets/GROQ_API_KEY",
+        ]:
+            try:
+                if os.path.exists(p):
+                    groq_key = open(p, encoding="utf-8").read().strip()
+                    if groq_key:
+                        break
+            except Exception:
+                pass
 
     cerebras_key = os.getenv("CEREBRAS_API_KEY", "").strip()
     if not cerebras_key:
-        try:
-            p = os.path.join(os.path.dirname(__file__), "..", "CEREBRAS_API_KEY.txt")
-            if os.path.exists(p):
-                cerebras_key = open(p, encoding="utf-8").read().strip()
-        except Exception:
-            pass
+        for p in [
+            os.path.join(os.path.dirname(__file__), "..", "CEREBRAS_API_KEY.txt"),
+            "/etc/secrets/CEREBRAS_API_KEY",
+        ]:
+            try:
+                if os.path.exists(p):
+                    cerebras_key = open(p, encoding="utf-8").read().strip()
+                    if cerebras_key:
+                        break
+            except Exception:
+                pass
 
     prompt = (
         "Sos un asistente legal argentino. Escribí UNA sola oración en español rioplatense "
@@ -416,6 +426,10 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
         f"Título: {titulo}\n"
         f"Texto: {texto[:3000]}"
     )
+
+    log = logging.getLogger(__name__)
+    log.info("[resumir_ia] groq_key=%s, cerebras_key=%s",
+             "OK" if groq_key else "MISSING", "OK" if cerebras_key else "MISSING")
 
     # 1) Groq — Llama 3.3 70B (más inteligente, ~300-1000 tok/s)
     if groq_key:
@@ -438,9 +452,9 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
                     if gen and len(gen) > 30:
                         return gen[:950]
                 else:
-                    logging.getLogger(__name__).debug("Groq %s: %s", resp.status_code, resp.text[:200])
+                    log.info("[resumir_ia] Groq status %s: %s", resp.status_code, resp.text[:200])
         except Exception as e:
-            logging.getLogger(__name__).debug("Groq falló: %s", e)
+            log.info("[resumir_ia] Groq falló: %s", e)
 
     # 2) Cerebras — Qwen3/Llama (fallback, ~1M tokens/día)
     if cerebras_key:
@@ -463,9 +477,9 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
                     if gen and len(gen) > 30:
                         return gen[:950]
                 else:
-                    logging.getLogger(__name__).debug("Cerebras %s: %s", resp.status_code, resp.text[:200])
+                    log.info("[resumir_ia] Cerebras status %s: %s", resp.status_code, resp.text[:200])
         except Exception as e:
-            logging.getLogger(__name__).debug("Cerebras falló: %s", e)
+            log.info("[resumir_ia] Cerebras falló: %s", e)
 
     # 3) HuggingFace Mistral — respaldo (ya existente)
     if hf_token and hf_token.strip().startswith("hf_"):
@@ -495,7 +509,7 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
                     if gen and len(gen) > 30:
                         return gen[:950]
         except Exception as e:
-            logging.getLogger(__name__).debug("HuggingFace Mistral falló: %s", e)
+            log.info("[resumir_ia] HuggingFace Mistral falló: %s", e)
 
     # 4) bart-large-cnn — respaldo extractivo con IA
     if hf_token and hf_token.strip().startswith("hf_"):
