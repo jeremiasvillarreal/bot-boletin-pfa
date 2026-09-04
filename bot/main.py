@@ -5,6 +5,7 @@ Arquitectura:
   - Main thread: Telegram polling (run_polling) con restart loop
   - Daemon thread: FastAPI /health (uvicorn) para Render + UptimeRobot
   - Daemon thread: Self-ping cada 10min para evitar Render Free spin-down
+  - Daemon thread: Watchdog — si no hay updates en 20min, fuerza restart
 
 Healthcheck:
   GET /health -> 200 OK (solo cuando bot está listo)
@@ -13,6 +14,7 @@ Healthcheck:
 
 import gc
 import logging
+import os
 import signal
 import sys
 import threading
@@ -47,6 +49,22 @@ logger = logging.getLogger(__name__)
 
 _startup_ready = threading.Event()  # set cuando el bot está listo para recibir
 
+# --- Watchdog: tracking de última actividad ---
+
+_last_activity = time.monotonic()  # se actualiza con cada update de Telegram
+_activity_lock = threading.Lock()
+
+def touch_activity() -> None:
+    """Llamar cuando llega un update de Telegram."""
+    global _last_activity
+    with _activity_lock:
+        _last_activity = time.monotonic()
+
+def get_last_activity_age() -> float:
+    """Segundos desde la última actividad."""
+    with _activity_lock:
+        return time.monotonic() - _last_activity
+
 # --- FastAPI health server ---
 
 health_app = FastAPI(title="Telegram Bot Health")
@@ -67,7 +85,13 @@ async def health(response: Response):
 async def root():
     """Info básica del bot."""
     ready = _startup_ready.is_set()
-    return {"status": "ok" if ready else "starting", "bot": "telegram-modular", "mode": MODO}
+    age = get_last_activity_age()
+    return {
+        "status": "ok" if ready else "starting",
+        "bot": "telegram-modular",
+        "mode": MODO,
+        "last_activity_sec_ago": int(age),
+    }
 
 
 def start_health_server() -> threading.Thread:
@@ -114,6 +138,79 @@ def start_self_ping() -> threading.Thread:
     return thread
 
 
+# --- Watchdog: fuerza restart si el bot está muerto ---
+
+_WATCHDOG_STALE_SECONDS = 20 * 60  # 20 minutos sin updates → reiniciar
+
+
+def _watchdog_loop() -> None:
+    """Daemon thread que verifica si el bot sigue vivo.
+
+    Si pasan 20 minutos sin ningún update de Telegram, significa que:
+    - Render durmió el servicio y la conexión de polling se rompió
+    - El Updater está colgado en una conexión muerta
+    - Hay un bug en el event loop
+
+    En esos casos, fuerza restart con os._exit() para que Render reinicie el proceso.
+    """
+    logger.info("[watchdog] Iniciado — timeout de %ds sin actividad", _WATCHDOG_STALE_SECONDS)
+
+    # Esperar a que el bot arranque
+    while not _startup_ready.is_set():
+        time.sleep(2)
+
+    while True:
+        time.sleep(120)  # check cada 2 minutos
+
+        age = get_last_activity_age()
+
+        # Solo alertar si el bot lleva mucho tiempo activo (>5min) sin updates
+        # para no disparar durante arranque o si no hay tráfico
+        uptime = (datetime.now(timezone.utc) - StartTime).total_seconds()
+        if uptime < 300:
+            continue  # primeros 5min, no alertar
+
+        if age > _WATCHDOG_STALE_SECONDS:
+            logger.critical(
+                "[watchdog] BOT MUERTO — %ds sin actividad. "
+                "Forzando restart para reconectar a Telegram. "
+                "(posible Render sleep/wake o conexión colgada)",
+                int(age),
+            )
+            # os._exit fuerza kill inmediato — Render reinicia el proceso
+            os._exit(1)
+        elif age > 600:
+            logger.warning(
+                "[watchdog] Alerta: %ds sin actividad (timeout a %ds)",
+                int(age), _WATCHDOG_STALE_SECONDS,
+            )
+
+
+def start_watchdog() -> threading.Thread:
+    """Lanza watchdog en thread daemon."""
+    thread = threading.Thread(target=_watchdog_loop, name="watchdog", daemon=True)
+    thread.start()
+    return thread
+
+
+# --- Activity tracker: se registra como handler de todos los updates ---
+
+async def _activity_tracker(update, context) -> None:
+    """Handler que se ejecuta con cada update para marcar actividad."""
+    touch_activity()
+
+
+def _setup_activity_tracking(application: Application) -> None:
+    """Registra un handler de prioridad máxima que trackea actividad."""
+    from telegram.ext import MessageHandler, filters
+    # Group -1 = se ejecuta ANTES que todos los otros handlers
+    application.add_handler(
+        MessageHandler(filters.ALL, _activity_tracker), group=-1
+    )
+
+
+# --- Build & cleanup ---
+
 def build_application() -> Application:
     """Construye Application de PTB, registra handlers y jobs."""
     app = (
@@ -123,6 +220,9 @@ def build_application() -> Application:
         .connect_timeout(15)
         .build()
     )
+
+    # Activity tracker (group -1, se ejecuta primero)
+    _setup_activity_tracking(app)
 
     register_handlers(app)
     logger.info("[bot] Handlers registrados")
@@ -156,6 +256,7 @@ def main() -> None:
     Main thread  → polling Telegram (run_polling + restart loop)
     Daemon thread → health server FastAPI
     Daemon thread → self-ping (keep-alive Render Free)
+    Daemon thread → watchdog (detecta bot muerto, fuerza restart)
     """
     logger.info("[bot] Iniciando — MODO=%s PORT=%d", MODO, PORT)
 
@@ -165,7 +266,10 @@ def main() -> None:
     # 2) Self-ping para mantener vivo en Render Free
     start_self_ping()
 
-    # 3) Check rápido de Playwright (solo log)
+    # 3) Watchdog para detectar bot muerto
+    start_watchdog()
+
+    # 4) Check rápido de Playwright (solo log)
     try:
         from scraper.base import PLAYWRIGHT_AVAILABLE
         if PLAYWRIGHT_AVAILABLE:
@@ -175,7 +279,7 @@ def main() -> None:
     except Exception:
         pass
 
-    # 4) Manejo de señales
+    # 5) Manejo de señales
     def _signal_handler(signum, _frame):
         logger.info("[bot] Señal recibida %s, cerrando...", signal.Signals(signum).name)
 
@@ -185,7 +289,7 @@ def main() -> None:
         except ValueError:
             pass
 
-    # 4) Polling con restart automático
+    # 6) Polling con restart automático
     #    Si run_polling() muere (Render sleep, network, exception),
     #    reconstruye Application y relanza.
     restart_count = 0
@@ -204,7 +308,6 @@ def main() -> None:
             logger.info("[bot] Iniciando polling... (restart #%d)", restart_count)
 
             # Marcar como listo DESPUÉS de build pero ANTES de polling
-            # para que el health check responda 200 cuando Render pregunte
             _startup_ready.set()
 
             application.run_polling(
