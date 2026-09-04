@@ -4,6 +4,7 @@ bot.main — Entrypoint del Bot Telegram modular 24/7.
 Arquitectura:
   - Main thread: Telegram polling (run_polling) con restart loop
   - Daemon thread: FastAPI /health (uvicorn) para Render + UptimeRobot
+  - Daemon thread: Self-ping cada 10min para evitar Render Free spin-down
 
 Healthcheck:
   GET /health -> 200 OK
@@ -16,6 +17,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import httpx
 import uvicorn
 from fastapi import FastAPI
 from telegram.ext import Application
@@ -66,6 +68,31 @@ def start_health_server() -> threading.Thread:
     return thread
 
 
+# --- Self-ping para mantener Render Free vivo ---
+
+_SELF_PING_INTERVAL = 600  # 10 minutos (Render Free spindown a los 15 min)
+
+
+def _self_ping_loop() -> None:
+    """Daemon thread que hace GET /health cada 10 min para evitar spin-down de Render Free."""
+    url = f"http://localhost:{PORT}/health"
+    logger.info("[self-ping] Iniciado — ping cada %ds a %s", _SELF_PING_INTERVAL, url)
+    while True:
+        time.sleep(_SELF_PING_INTERVAL)
+        try:
+            resp = httpx.get(url, timeout=10.0)
+            logger.info("[self-ping] OK — status=%d", resp.status_code)
+        except Exception as e:
+            logger.warning("[self-ping] Falló: %s", e)
+
+
+def start_self_ping() -> threading.Thread:
+    """Lanza self-ping en thread daemon."""
+    thread = threading.Thread(target=_self_ping_loop, name="self-ping", daemon=True)
+    thread.start()
+    return thread
+
+
 def build_application() -> Application:
     """Construye Application de PTB, registra handlers y jobs."""
     app = (
@@ -91,13 +118,17 @@ def main() -> None:
 
     Main thread  → polling Telegram (run_polling + restart loop)
     Daemon thread → health server FastAPI
+    Daemon thread → self-ping (keep-alive Render Free)
     """
     logger.info("[bot] Iniciando — MODO=%s PORT=%d", MODO, PORT)
 
     # 1) Health server en thread separado (no bloquea polling)
     start_health_server()
 
-    # 2) Manejo de señales
+    # 2) Self-ping para mantener vivo en Render Free
+    start_self_ping()
+
+    # 3) Manejo de señales
     def _signal_handler(signum, _frame):
         logger.info("[bot] Señal recibida %s, cerrando...", signal.Signals(signum).name)
 
@@ -107,7 +138,7 @@ def main() -> None:
         except ValueError:
             pass
 
-    # 3) Polling con restart automático
+    # 4) Polling con restart automático
     #    Si run_polling() muere (Render sleep, network, exception),
     #    reconstruye Application y relanza.
     restart_count = 0

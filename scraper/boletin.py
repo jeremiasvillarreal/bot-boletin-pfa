@@ -381,8 +381,8 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
 
     Proveedores LLM (en orden de prioridad):
       1. Groq (Llama 3.3 70B) — más inteligente, ultrarrápido
-      2. Cerebras (Qwen3/Llama) — fallback alto volumen
-      3. HuggingFace Mistral-7B — respaldo
+      2. HuggingFace Mistral-7B — respaldo
+      3. bart-large-cnn — respaldo extractivo con IA
       4. Extractivo local — último recurso sin IA
     """
     if not texto or len(texto.strip()) < 50:
@@ -405,20 +405,6 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
             except Exception:
                 pass
 
-    cerebras_key = os.getenv("CEREBRAS_API_KEY", "").strip()
-    if not cerebras_key:
-        for p in [
-            os.path.join(os.path.dirname(__file__), "..", "CEREBRAS_API_KEY.txt"),
-            "/etc/secrets/CEREBRAS_API_KEY",
-        ]:
-            try:
-                if os.path.exists(p):
-                    cerebras_key = open(p, encoding="utf-8").read().strip()
-                    if cerebras_key:
-                        break
-            except Exception:
-                pass
-
     prompt = (
         "Sos un asistente legal argentino. Escribí UNA sola oración en español rioplatense "
         "que resuma de qué trata esta norma del Boletín Oficial. Sé claro y directo. "
@@ -428,8 +414,7 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
     )
 
     log = logging.getLogger(__name__)
-    log.info("[resumir_ia] groq_key=%s, cerebras_key=%s",
-             "OK" if groq_key else "MISSING", "OK" if cerebras_key else "MISSING")
+    log.info("[resumir_ia] groq_key=%s", "OK" if groq_key else "MISSING")
 
     # 1) Groq — Llama 3.3 70B (más inteligente, ~300-1000 tok/s)
     if groq_key:
@@ -456,32 +441,7 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
         except Exception as e:
             log.info("[resumir_ia] Groq falló: %s", e)
 
-    # 2) Cerebras — Qwen3/Llama (fallback, ~1M tokens/día)
-    if cerebras_key:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    "https://api.cerebras.ai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {cerebras_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": "gpt-oss-120b",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 150,
-                        "temperature": 0.2,
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    gen = data["choices"][0]["message"]["content"].strip()
-                    gen = re.sub(r"^(Resumen:|La norma|Esta norma|El decreto)\s*", "", gen, flags=re.I).strip()
-                    if gen and len(gen) > 30:
-                        return gen[:950]
-                else:
-                    log.info("[resumir_ia] Cerebras status %s: %s", resp.status_code, resp.text[:200])
-        except Exception as e:
-            log.info("[resumir_ia] Cerebras falló: %s", e)
-
-    # 3) HuggingFace Mistral — respaldo (ya existente)
+    # 2) HuggingFace Mistral — respaldo (ya existente)
     if hf_token and hf_token.strip().startswith("hf_"):
         token = hf_token.strip()
         headers_hf = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -511,7 +471,7 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
         except Exception as e:
             log.info("[resumir_ia] HuggingFace Mistral falló: %s", e)
 
-    # 4) bart-large-cnn — respaldo extractivo con IA
+    # 3) bart-large-cnn — respaldo extractivo con IA
     if hf_token and hf_token.strip().startswith("hf_"):
         try:
             url2 = "https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn"
@@ -533,7 +493,7 @@ async def resumir_ia(texto: str, titulo: str = "", hf_token: str | None = None) 
         except Exception:
             pass
 
-    # 5) Fallback: extractivo propio (sin IA)
+    # 4) Fallback: extractivo propio (sin IA)
     return _resumen_extractivo(texto, titulo)
 
 # CLI para testing
