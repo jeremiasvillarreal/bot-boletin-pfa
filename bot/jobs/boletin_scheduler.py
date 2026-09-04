@@ -141,7 +141,16 @@ async def _enviar_hits(bot, hits, avisos_total: int):
                 pass
 
 async def poll_boletin_once(bot, force_notify: bool = False, chat_id: str | None = None) -> str:
-    """Ejecuta un poll completo, retorna string status."""
+    """Ejecuta un poll completo, retorna string status. Error-bounded."""
+    try:
+        return await _poll_boletin_once_inner(bot, force_notify, chat_id)
+    except Exception as exc:
+        logger.exception("[boletin] poll_boletin_once crash evitado: %s", exc)
+        return f"error: {exc}"
+
+
+async def _poll_boletin_once_inner(bot, force_notify: bool = False, chat_id: str | None = None) -> str:
+    """Lógica interna del poll — separada para try/except envelope."""
     from bot.config import get_boletin_palabras
     from scraper.boletin import filtrar_por_palabras, scrape_primera
 
@@ -218,73 +227,90 @@ async def poll_boletin_once(bot, force_notify: bool = False, chat_id: str | None
         return f"0 hits de {len(avisos)}"
 
 async def _job_07(context: ContextTypes.DEFAULT_TYPE):
+    """Job 07:00 ART — check edición + scrape. Error-bounded para no crashear scheduler."""
     global _pending_07
-    logger.info("[boletin] Job 07:00 ART ejecutando")
-    hoy = datetime.now(BA_TZ).date()
-    if await es_feriado(hoy):
-        logger.info("[boletin] 07:00 skip finde/feriado %s", hoy)
+    try:
+        logger.info("[boletin] Job 07:00 ART ejecutando")
+        hoy = datetime.now(BA_TZ).date()
+        if await es_feriado(hoy):
+            logger.info("[boletin] 07:00 skip finde/feriado %s", hoy)
+            _pending_07 = False
+            return
+        from bot.config import get_boletin_palabras
+        if not get_boletin_palabras():
+            logger.info("[boletin] 07:00 sin palabras, skip")
+            return
+        # poll sin forzar notificación de "sin avisos" aún
+        from scraper.boletin import scrape_primera
+        avisos = await scrape_primera(hoy)
+        if not avisos:
+            logger.info("[boletin] 07:00 sin edición aún, retry 08:00")
+            _pending_07 = True
+            return
+        # hay edición, procesar
         _pending_07 = False
-        return
-    from bot.config import get_boletin_palabras
-    if not get_boletin_palabras():
-        logger.info("[boletin] 07:00 sin palabras, skip")
-        return
-    # poll sin forzar notificación de "sin avisos" aún
-    from scraper.boletin import scrape_primera
-    avisos = await scrape_primera(hoy)
-    if not avisos:
-        logger.info("[boletin] 07:00 sin edición aún, retry 08:00")
-        _pending_07 = True
-        return
-    # hay edición, procesar
-    _pending_07 = False
-    result = await poll_boletin_once(context.bot, force_notify=False)
-    logger.info("[boletin] 07:00 result %s", result)
-    # si 0 hits pero hay edición, igual notificar discreto? opcional
-    # poll_boletin_once ya avisó hits si hay; si 0 hits no avisamos para no spamear
+        result = await poll_boletin_once(context.bot, force_notify=False)
+        logger.info("[boletin] 07:00 result %s", result)
+    except Exception as exc:
+        logger.exception("[boletin] _job_07 crash evitado: %s", exc)
 
 async def _job_08(context: ContextTypes.DEFAULT_TYPE):
+    """Job 08:00 ART — retry si 07 no encontró edición. Error-bounded."""
     global _pending_07
-    logger.info("[boletin] Job 08:00 ART ejecutando pending=%s", _pending_07)
-    hoy = datetime.now(BA_TZ).date()
-    if await es_feriado(hoy):
+    try:
+        logger.info("[boletin] Job 08:00 ART ejecutando pending=%s", _pending_07)
+        hoy = datetime.now(BA_TZ).date()
+        if await es_feriado(hoy):
+            _pending_07 = False
+            return
+        from bot.config import get_boletin_palabras
+        if not get_boletin_palabras():
+            return
+        if not _pending_07:
+            # ya se procesó a las 07, pero igual verificar si hubo nueva edición entre 07-08 (cambio hash)
+            result = await poll_boletin_once(context.bot, force_notify=False)
+            logger.info("[boletin] 08:00 (no pending) check %s", result)
+            return
+        # pendiente → reintentar
         _pending_07 = False
-        return
-    from bot.config import get_boletin_palabras
-    if not get_boletin_palabras():
-        return
-    if not _pending_07:
-        # ya se procesó a las 07, pero igual verificar si hubo nueva edición entre 07-08 (cambio hash)
+        from scraper.boletin import scrape_primera
+        avisos = await scrape_primera(hoy)
+        if not avisos:
+            # ahora sí avisar que no hubo publicación
+            chat_ids = await _get_notificar_chat_ids()
+            for cid in chat_ids:
+                try:
+                    await context.bot.send_message(chat_id=cid, text=f"⚠️ *Boletín 1ra sin publicación al 08:00 ART* hoy {hoy.strftime('%d/%m/%Y')}. No se detectó edición (posible demora o feriado puente). Reintento mañana 07:00.", parse_mode="Markdown")
+                except Exception as e:
+                    logger.warning("08:00 notify fallo %s", e)
+            logger.info("[boletin] 08:00 sin publicación, notificado")
+            return
         result = await poll_boletin_once(context.bot, force_notify=False)
-        logger.info("[boletin] 08:00 (no pending) check %s", result)
-        return
-    # pendiente → reintentar
-    _pending_07 = False
-    from scraper.boletin import scrape_primera
-    avisos = await scrape_primera(hoy)
-    if not avisos:
-        # ahora sí avisar que no hubo publicación
-        chat_ids = await _get_notificar_chat_ids()
-        for cid in chat_ids:
-            try:
-                await context.bot.send_message(chat_id=cid, text=f"⚠️ *Boletín 1ra sin publicación al 08:00 ART* hoy {hoy.strftime('%d/%m/%Y')}. No se detectó edición (posible demora o feriado puente). Reintento mañana 07:00.", parse_mode="Markdown")
-            except Exception as e:
-                logger.warning("08:00 notify fallo %s", e)
-        logger.info("[boletin] 08:00 sin publicación, notificado")
-        return
-    result = await poll_boletin_once(context.bot, force_notify=False)
-    logger.info("[boletin] 08:00 retry result %s", result)
+        logger.info("[boletin] 08:00 retry result %s", result)
+    except Exception as exc:
+        logger.exception("[boletin] _job_08 crash evitado: %s", exc)
 
 def setup_boletin_jobs(application: Application) -> None:
     if application.job_queue is None:
         logger.warning("[boletin] JobQueue no disponible")
         return
     # 07:00 y 08:00 ART daily
-    # APScheduler usa UTC, convertir: ART = UTC-3, 07:00 ART = 10:00 UTC, 08:00 = 11:00 UTC
-    # Pero con tzinfo BA, run_daily respeta timezone si se pasa datetime.time con tzinfo
     from datetime import time
     application.job_queue.run_daily(_job_07, time(hour=7, minute=0, tzinfo=BA_TZ), name="boletin_07")
     application.job_queue.run_daily(_job_08, time(hour=8, minute=0, tzinfo=BA_TZ), name="boletin_08")
     logger.info("[boletin] Jobs 07:00 y 08:00 ART registrados")
-    # catch-up al arranque si es después de las 07 y antes de 12 y es día hábil, para no perder edición si bot reinició
-    # se hará como run_once a los 15s mediante poll
+
+    # Catch-up al arranque: si es después de las 07 y antes de 13 en día hábil,
+    # hacer un poll único para no perder la edición del día si el bot se reinició
+    now = datetime.now(BA_TZ)
+    if 7 <= now.hour < 13 and now.weekday() < 5:
+        async def _catchup_job(context: ContextTypes.DEFAULT_TYPE):
+            """Poll único al arranque para catch-up si el bot se reinició en horario hábil."""
+            try:
+                logger.info("[boletin] Catch-up al arranque — ejecutando poll...")
+                result = await poll_boletin_once(context.bot, force_notify=False)
+                logger.info("[boletin] Catch-up result: %s", result)
+            except Exception as exc:
+                logger.exception("[boletin] Catch-up crash evitado: %s", exc)
+        application.job_queue.run_once(_catchup_job, when=15, name="boletin_catchup")
+        logger.info("[boletin] Catch-up programado a los 15s (hora AR: %s)", now.strftime("%H:%M"))

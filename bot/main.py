@@ -7,9 +7,11 @@ Arquitectura:
   - Daemon thread: Self-ping cada 10min para evitar Render Free spin-down
 
 Healthcheck:
-  GET /health -> 200 OK
+  GET /health -> 200 OK (solo cuando bot está listo)
+  GET /health -> 503 (durante startup, antes de polling)
 """
 
+import gc
 import logging
 import signal
 import sys
@@ -19,7 +21,7 @@ from datetime import datetime, timezone
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from telegram.ext import Application
 
 from bot.config import MODO, PORT, TELEGRAM_TOKEN
@@ -41,21 +43,31 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# --- Startup readiness flag ---
+
+_startup_ready = threading.Event()  # set cuando el bot está listo para recibir
+
 # --- FastAPI health server ---
 
 health_app = FastAPI(title="Telegram Bot Health")
 
 
 @health_app.get("/health")
-async def health():
-    """Endpoint para Render healthCheckPath y UptimeRobot."""
+async def health(response: Response):
+    """Endpoint para Render healthCheckPath y UptimeRobot.
+    Retorna 503 durante startup para que Render no mate el proceso antes de tiempo.
+    """
+    if not _startup_ready.is_set():
+        response.status_code = 503
+        return {"status": "starting"}
     return {"status": "ok"}
 
 
 @health_app.get("/")
 async def root():
     """Info básica del bot."""
-    return {"status": "ok", "bot": "telegram-modular", "mode": MODO}
+    ready = _startup_ready.is_set()
+    return {"status": "ok" if ready else "starting", "bot": "telegram-modular", "mode": MODO}
 
 
 def start_health_server() -> threading.Thread:
@@ -77,6 +89,15 @@ def _self_ping_loop() -> None:
     """Daemon thread que hace GET /health cada 10 min para evitar spin-down de Render Free."""
     url = f"http://localhost:{PORT}/health"
     logger.info("[self-ping] Iniciado — ping cada %ds a %s", _SELF_PING_INTERVAL, url)
+    # Esperar a que el health server esté listo (máx 30s)
+    for _ in range(30):
+        try:
+            resp = httpx.get(url, timeout=5.0)
+            if resp.status_code in (200, 503):
+                break
+        except Exception:
+            pass
+        time.sleep(1)
     while True:
         time.sleep(_SELF_PING_INTERVAL)
         try:
@@ -113,6 +134,22 @@ def build_application() -> Application:
     return app
 
 
+def _cleanup_application(app: Application) -> None:
+    """Limpia recursos de una Application anterior para evitar memory leaks."""
+    try:
+        if app.job_queue:
+            app.job_queue.stop()
+    except Exception:
+        pass
+    try:
+        loop = app.bot_data.get("_loop")
+        if loop and not loop.is_closed():
+            loop.call_soon_threadsafe(loop.stop)
+    except Exception:
+        pass
+    gc.collect()
+
+
 def main() -> None:
     """Entrypoint principal.
 
@@ -128,7 +165,19 @@ def main() -> None:
     # 2) Self-ping para mantener vivo en Render Free
     start_self_ping()
 
-    # 3) Manejo de señales
+    # 3) Verificar Playwright al arranque (log informativo)
+    try:
+        from scraper.base import check_playwright_browser
+        pw_ok = check_playwright_browser()
+        if pw_ok:
+            logger.info("[bot] Playwright Chromium: OK")
+        else:
+            logger.warning("[bot] Playwright Chromium: NO INSTALADO — fallback scraping deshabilitado. "
+                           "Instalar con: playwright install --with-deps chromium")
+    except Exception as e:
+        logger.warning("[bot] No se pudo verificar Playwright: %s", e)
+
+    # 4) Manejo de señales
     def _signal_handler(signum, _frame):
         logger.info("[bot] Señal recibida %s, cerrando...", signal.Signals(signum).name)
 
@@ -142,11 +191,24 @@ def main() -> None:
     #    Si run_polling() muere (Render sleep, network, exception),
     #    reconstruye Application y relanza.
     restart_count = 0
+    current_app = None
     while True:
         restart_count += 1
         try:
+            # Limpiar app anterior si existe
+            if current_app is not None:
+                _cleanup_application(current_app)
+                current_app = None
+
             application = build_application()
+            current_app = application
+
             logger.info("[bot] Iniciando polling... (restart #%d)", restart_count)
+
+            # Marcar como listo DESPUÉS de build pero ANTES de polling
+            # para que el health check responda 200 cuando Render pregunte
+            _startup_ready.set()
+
             application.run_polling(
                 allowed_updates=None,
                 drop_pending_updates=True,

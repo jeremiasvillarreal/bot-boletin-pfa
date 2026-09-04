@@ -31,6 +31,25 @@ from playwright.async_api import Playwright
 CHROME_CDP_URL: str = os.getenv("CHROME_CDP_URL", "http://localhost:9222")
 MODO: str = os.getenv("MODO", "local").lower()
 
+# Cache de disponibilidad de Playwright browser (evita re-check en cada uso)
+_playwright_available: bool | None = None
+
+
+def check_playwright_browser() -> bool:
+    """Verifica si Chromium de Playwright está instalado. Cachea resultado."""
+    global _playwright_available
+    if _playwright_available is not None:
+        return _playwright_available
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        _playwright_available = True
+    except Exception:
+        _playwright_available = False
+    return _playwright_available
+
 
 def is_cdp_available(url: str | None = None) -> bool:
     """Chequea si el endpoint CDP responde en /json/version.
