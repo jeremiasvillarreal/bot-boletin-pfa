@@ -24,7 +24,7 @@ import uvicorn
 from fastapi import FastAPI, Response
 from telegram.ext import Application
 
-from bot.config import MODO, PORT, TELEGRAM_TOKEN
+from bot.config import MODO, PORT, RENDER_EXTERNAL_URL, TELEGRAM_TOKEN
 from bot.handlers import register_handlers
 from bot.jobs.boletin_scheduler import setup_boletin_jobs
 from bot.jobs.scheduler import setup_jobs
@@ -77,24 +77,24 @@ def start_health_server() -> threading.Thread:
 
 # --- Self-ping para mantener Render Free vivo ---
 
-_SELF_PING_INTERVAL = 600  # 10 min
+_SELF_PING_INTERVAL = 600  # 10 min (Render Free spindown a los 15 min)
 
 
 def _self_ping_loop() -> None:
-    url = f"http://localhost:{PORT}/health"
-    logger.info("[self-ping] Iniciado — ping cada %ds", _SELF_PING_INTERVAL)
-    for _ in range(30):
-        try:
-            resp = httpx.get(url, timeout=5.0)
-            if resp.status_code in (200, 503):
-                break
-        except Exception:
-            pass
-        time.sleep(1)
+    """Patea la URL pública de Render cada 10min para que no se duerma."""
+    # URL pública de Render (evita sleep). Si no está configurada, localhost.
+    ext = RENDER_EXTERNAL_URL
+    if ext:
+        url = f"{ext.rstrip('/')}/health"
+    else:
+        url = f"http://localhost:{PORT}/health"
+
+    logger.info("[self-ping] Iniciado — ping cada %ds a %s", _SELF_PING_INTERVAL, url)
+
     while True:
         time.sleep(_SELF_PING_INTERVAL)
         try:
-            resp = httpx.get(url, timeout=10.0)
+            resp = httpx.get(url, timeout=15.0)
             logger.info("[self-ping] OK — status=%d", resp.status_code)
         except Exception as e:
             logger.warning("[self-ping] Falló: %s", e)

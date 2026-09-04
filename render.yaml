@@ -26,3 +26,5 @@ services:
         value: cloud
       - key: CHROME_CDP_URL
         value: http://localhost:9222
+      - key: RENDER_EXTERNAL_URL
+        value: https://bot-boletin-pfa.onrender.com

@@ -37,6 +37,11 @@ TELEGRAM_TOKEN = TELEGRAM_TOKEN.strip()
 
 CHROME_CDP_URL: str = os.getenv("CHROME_CDP_URL", "http://localhost:9222").strip()
 
+# URL pública de Render para self-ping (evita sleep)
+# En Render: https://<service-name>.onrender.com
+# En local: None (no ping externo)
+RENDER_EXTERNAL_URL: str = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+
 try:
     PORT: int = int(os.getenv("PORT", "8000").strip())
 except ValueError as exc:
