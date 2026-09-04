@@ -165,17 +165,15 @@ def main() -> None:
     # 2) Self-ping para mantener vivo en Render Free
     start_self_ping()
 
-    # 3) Verificar Playwright al arranque (log informativo)
+    # 3) Check rápido de Playwright (solo log)
     try:
-        from scraper.base import check_playwright_browser
-        pw_ok = check_playwright_browser()
-        if pw_ok:
-            logger.info("[bot] Playwright Chromium: OK")
+        from scraper.base import PLAYWRIGHT_AVAILABLE
+        if PLAYWRIGHT_AVAILABLE:
+            logger.info("[bot] Playwright disponible (fallback scraping habilitado)")
         else:
-            logger.warning("[bot] Playwright Chromium: NO INSTALADO — fallback scraping deshabilitado. "
-                           "Instalar con: playwright install --with-deps chromium")
-    except Exception as e:
-        logger.warning("[bot] No se pudo verificar Playwright: %s", e)
+            logger.info("[bot] Playwright no instalado — scraping usa solo httpx (OK en nube)")
+    except Exception:
+        pass
 
     # 4) Manejo de señales
     def _signal_handler(signum, _frame):

@@ -161,6 +161,9 @@ async def scrape_tercera_httpx(fecha: date | None = None) -> list[dict]:
     return await _scrape_seccion_httpx("tercera", fecha)
 
 async def _scrape_seccion_playwright(seccion: str, fecha: date | None = None) -> list[dict]:
+    from scraper.base import PLAYWRIGHT_AVAILABLE
+    if not PLAYWRIGHT_AVAILABLE:
+        return []
     if fecha is None:
         fecha = datetime.now(BA_TZ).date()
     fecha_str = fecha.strftime("%Y%m%d")
@@ -243,6 +246,9 @@ async def scrape_detalle(url: str) -> str:
     except Exception:
         pass
     # fallback playwright si httpx no trajo contenido útil
+    from scraper.base import PLAYWRIGHT_AVAILABLE
+    if not PLAYWRIGHT_AVAILABLE:
+        return ""
     try:
         from playwright.async_api import async_playwright
         async with async_playwright() as p:

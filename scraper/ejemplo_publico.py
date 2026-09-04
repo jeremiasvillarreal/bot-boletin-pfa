@@ -22,10 +22,9 @@ import asyncio
 
 import httpx
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
 from pydantic import BaseModel, Field
 
-from scraper.base import close_browser, get_context_and_page
+from scraper.base import PLAYWRIGHT_AVAILABLE, close_browser, get_context_and_page
 
 
 # --- Modelos pydantic ---
@@ -64,6 +63,9 @@ async def scrape_quotes(url: str = "https://quotes.toscrape.com/") -> list[dict]
     Returns:
         list[dict]: Lista de dicts validados por Quote.
     """
+    if not PLAYWRIGHT_AVAILABLE:
+        return []
+    from playwright.async_api import async_playwright
     async with async_playwright() as p:
         browser, context, page = await get_context_and_page(p)
         try:

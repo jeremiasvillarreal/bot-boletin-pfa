@@ -15,6 +15,7 @@ Uso local vs nube:
     Sin Chrome debug disponible. Define env MODO=cloud y el helper va
     directo a playwright.chromium.launch(headless=True) sin intentar CDP.
     También funciona con MODO=local si CDP no responde (fallback automático).
+    Si Playwright/Chromium no está instalado, se omite el fallback silenciosamente.
 
 Env vars:
     CHROME_CDP_URL  default http://localhost:9222
@@ -24,31 +25,51 @@ Asumido: Chrome debug puerto 9222
 """
 
 import os
+import logging
 
 import httpx
-from playwright.async_api import Playwright
+
+# Playwright es OPCIONAL — si no está instalado, el fallback de scraping se omite
+try:
+    from playwright.async_api import Playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    Playwright = None  # type: ignore[misc,assignment]
+    PLAYWRIGHT_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 CHROME_CDP_URL: str = os.getenv("CHROME_CDP_URL", "http://localhost:9222")
 MODO: str = os.getenv("MODO", "local").lower()
 
-# Cache de disponibilidad de Playwright browser (evita re-check en cada uso)
-_playwright_available: bool | None = None
+# Cache de disponibilidad de Chromium browser (evita re-check en cada uso)
+_chromium_available: bool | None = None
 
 
 def check_playwright_browser() -> bool:
-    """Verifica si Chromium de Playwright está instalado. Cachea resultado."""
-    global _playwright_available
-    if _playwright_available is not None:
-        return _playwright_available
+    """Verifica si Playwright + Chromium están disponibles. Cachea resultado.
+
+    No lanza browser — solo verifica que el paquete esté importable y que
+    el ejecutable de Chromium exista en la ubicación esperada.
+    """
+    global _chromium_available
+    if _chromium_available is not None:
+        return _chromium_available
+    if not PLAYWRIGHT_AVAILABLE:
+        _chromium_available = False
+        return False
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            browser.close()
-        _playwright_available = True
+        from playwright._impl._driver import compute_driver_executable
+        driver_executable = compute_driver_executable()
+        if driver_executable and os.path.exists(str(driver_executable)):
+            _chromium_available = True
+        else:
+            _chromium_available = False
     except Exception:
-        _playwright_available = False
-    return _playwright_available
+        # Si no podemos verificar, intentamos inferir por la existencia
+        # del directorio de navegadores de Playwright
+        _chromium_available = False
+    return _chromium_available
 
 
 def is_cdp_available(url: str | None = None) -> bool:
@@ -56,12 +77,6 @@ def is_cdp_available(url: str | None = None) -> bool:
 
     Usa httpx GET síncrono con timeout corto (2s). Retorna True si
     status 200, False en cualquier excepción/timeout.
-
-    Args:
-        url: URL base CDP (default: CHROME_CDP_URL por env).
-
-    Returns:
-        bool: True si CDP disponible.
     """
     target = (url or os.getenv("CHROME_CDP_URL", "http://localhost:9222")).rstrip("/")
     endpoint = f"{target}/json/version"
@@ -84,7 +99,7 @@ async def is_cdp_available_async(url: str | None = None) -> bool:
         return False
 
 
-async def get_browser(playwright: Playwright):
+async def get_browser(playwright: "Playwright"):
     """Obtiene un Browser.
 
     Intenta connect_over_cdp(CHROME_CDP_URL, timeout=2s).
@@ -96,7 +111,6 @@ async def get_browser(playwright: Playwright):
     Returns:
         Browser: instancia conectada o lanzada.
     """
-    # Re-leer env en cada llamada por si cambió entre imports
     modo = os.getenv("MODO", "local").lower()
     cdp_url = os.getenv("CHROME_CDP_URL", "http://localhost:9222")
 
@@ -105,17 +119,13 @@ async def get_browser(playwright: Playwright):
         return await playwright.chromium.launch(headless=True)
 
     # Local: intentar CDP con timeout 2s
-    # Chequeo previo opcional para evitar excepción ruidosa
     if is_cdp_available(cdp_url):
         try:
-            # timeout en ms para connect_over_cdp
             browser = await playwright.chromium.connect_over_cdp(cdp_url, timeout=2000)
             return browser
         except Exception:
-            # Fallthrough a launch headless
             pass
     else:
-        # Intento directo igual con timeout corto por si el GET falló por falso negativo
         try:
             browser = await playwright.chromium.connect_over_cdp(cdp_url, timeout=2000)
             return browser
@@ -125,7 +135,7 @@ async def get_browser(playwright: Playwright):
     return await playwright.chromium.launch(headless=True)
 
 
-async def get_context_and_page(playwright: Playwright):
+async def get_context_and_page(playwright: "Playwright"):
     """Crea browser + context + page usando get_browser().
 
     Returns:
